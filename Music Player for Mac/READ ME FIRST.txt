@@ -1,0 +1,126 @@
+MUSIC PLAYER FOR MAC
+====================
+
+The same player as on the PC - library, playlists, search, themes,
+visualizer, lyrics, adding songs to your library - for your Mac.
+
+On a Mac it runs inside Google Chrome (or Microsoft Edge or Brave), in a
+window of its own with its own icon. Apple Music's full songs only play in a
+real browser on the Mac, so that is what it uses.
+
+
+SETTING IT UP (once)
+--------------------
+1. Copy this whole "Music Player for Mac" folder to the Mac
+   (AirDrop, a USB stick, iCloud Drive ...). Put it anywhere, e.g. Documents.
+
+2. Make sure Google Chrome is installed on the Mac (or Microsoft Edge / Brave).
+   Get Chrome from https://www.google.com/chrome/ if not.
+
+3. Open Terminal (press Cmd + Space, type Terminal, press Return).
+   Type  bash  and a space, then drag the file  install.sh  from this folder
+   into the Terminal window, and press Return.
+
+4. Music Player opens. With Edge or Brave the player is there straight away.
+   With Google Chrome it comes together with Chrome's Extensions page and a
+   window with directions, the first time. Do what it says once:
+     - switch on "Developer mode" (top right of the Extensions page)
+     - click "Load unpacked"
+     - press Cmd + Shift + G, paste
+           ~/Library/Application Support/Music Player/extension
+       press Return, click "Select"
+     - close the Extensions page, press Cmd + R in the Music Player window
+
+5. Sign in to Apple Music in the Music Player window (the OPEN APPLE MUSIC key,
+   then Apple's own Sign In button).
+
+From then on just open "Music Player" - it is in the Applications folder in
+your home folder, in Launchpad and in Spotlight. Drag it to the Dock.
+
+The player has a browser profile of its own: its own sign-in and settings,
+apart from your everyday browsing. (With Brave, Widevine - which Apple
+Music's full songs need - is switched on in it from the start.)
+
+
+MUSIC PLAYER IN THE DOCK
+------------------------
+Music Player stays open as long as the player is, so the Dock shows the dot
+under it, like under any open app.
+- Click it (or pick it with Cmd + Tab) and the player comes to the front -
+  out of the Dock if it was minimized, opened again if its window was closed.
+- Quit it (right-click it in the Dock, Quit) and the player quits too.
+  Quit the player (Cmd + Q in its window) and Music Player goes too.
+- The browser the player runs in shows in the Dock as well, with its own
+  icon: it is a second copy of that browser, the player's own.
+
+
+THE COMPACT PLAYER FLOATS ON TOP
+-------------------------------
+Press COMPACT (or Ctrl + M) and the small player opens in a little window of
+its own that stays above every other window - Brave, Safari, Finder, any app -
+so you can keep it in a corner while you do other things. Drag it wherever you
+like; drag its edge to resize it.
+- The tab it came from shows "FLOATING ON TOP" meanwhile.
+- LIBRARY on the small player (or closing it, or its "back to tab" button)
+  brings the full player back.
+- The pin key on the small player switches the floating off and on again
+  (it is the "Keep on top" setting under THEMES). With it off, the compact
+  player is the browser window made small, as before.
+- Needs Chrome, Edge or Brave 116 or later (2023 on). The browser only opens
+  such a window right after a click or a key press, so when "Shrink to the
+  compact player when music starts" kicks in a while after your click, the
+  compact player may come up in the browser window instead.
+
+
+THE VISUALIZER HEARS THE MUSIC
+------------------------------
+The page cannot hear Apple's songs (they are copy-protected), but the browser
+lets the Music Player extension listen to the tab and pass the sound on:
+- Started from the "Music Player" app: it just works.
+- In your everyday browser (the extension loaded there with "Load unpacked"):
+  click the Music Player button in the toolbar once, while the Apple Music tab
+  is in front - each time Apple Music is opened. (Not pinned? It is in the
+  puzzle-piece menu next to the address bar; the pin there keeps it in view.)
+  Until then the visualizer dances to a built-in beat, says DEMO, and shows a
+  reminder. The button shows ON while it listens.
+- While it listens, the browser marks the tab as being captured, and the sound
+  is played on to your speakers by the extension. Nothing leaves your Mac.
+  If playing it on ever fails, the listening stops and the tab plays the
+  sound itself again. After a minute of silence (music paused) it stops by
+  itself, and starts again when the music does.
+
+
+WHAT IS DIFFERENT FROM THE PC
+-----------------------------
+- While the player is open the Dock shows the browser's icon next to Music
+  Player's (see MUSIC PLAYER IN THE DOCK).
+- Closing the player's window stops the music, but Music Player stays open,
+  like any Mac app: click it to open the player again, or quit it.
+- Adding songs to your library or playlists works the same and shows up on
+  your phone and your PC too.
+
+
+UPDATING
+--------
+Copy the newer "Music Player for Mac" folder over this one and run install.sh
+again (step 3). If the player is open, install.sh closes it first, and opens
+it again at the end. Your sign-in and settings stay. If Chrome asks you to
+switch the extension on again, repeat step 4.
+Coming from a version before this one (before November 2026)? Sign in to
+Apple Music once more, in the Music Player window: until now a mix-up of two
+names on the Mac's disk kept the player from getting a profile of its own,
+so it ran in your everyday browser instead.
+Using the extension in your everyday browser instead? After changing its
+files, press the reload arrow on the Music Player card on the Extensions page
+(brave://extensions or chrome://extensions), then reload the Apple Music tab.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+- "Music Player" says something has moved: run install.sh again.
+- The window shows plain Apple Music, not the player: the extension is not
+  switched on - do step 4 again, then Cmd + R.
+- Songs do not play: make sure you are signed in (step 5) and that your
+  Apple Music subscription is active.
+- To remove it: delete "Music Player" from your Applications folder and the
+  folder ~/Library/Application Support/Music Player

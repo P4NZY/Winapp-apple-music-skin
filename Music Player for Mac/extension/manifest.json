@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Music Player",
+  "version": "1.1",
+  "description": "The Music Player skin for Apple Music on the web: a retro hi-fi player with your library, themes, a visualizer and lyrics.",
+  "icons": { "128": "icon128.png" },
+  "permissions": ["tabCapture", "offscreen"],
+  "host_permissions": ["https://music.apple.com/*"],
+  "action": {
+    "default_icon": { "128": "icon128.png" },
+    "default_title": "Music Player: click while Apple Music is in front to let the visualizer hear the music"
+  },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://music.apple.com/*"],
+      "js": ["bridge-main.js", "skin.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://music.apple.com/*"],
+      "js": ["bridge-isolated.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

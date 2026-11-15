@@ -57,9 +57,9 @@ html[data-mp-theme] {
    also what makes these faces quick. */
 html[data-mp-mode="full"] .body-container,
 html[data-mp-mode="compact"] .body-container { display: none !important; }
-/* "keep on top" needs the Windows app; a browser window cannot do it */
-html:not([data-mp-host="windows"]) [data-act="ontop"],
-html:not([data-mp-host="windows"]) [data-opt="onTop"] { display: none !important; }
+/* "keep on top" needs the Windows app, or (Mac) a browser that can float a page: data-mp-pin */
+html:not([data-mp-host="windows"]):not([data-mp-pin="1"]) [data-act="ontop"],
+html:not([data-mp-host="windows"]):not([data-mp-pin="1"]) [data-opt="onTop"] { display: none !important; }
 
 /* the window is minimised or covered (player.js: setSeen): nothing animates */
 html[data-mp-seen="0"] *,

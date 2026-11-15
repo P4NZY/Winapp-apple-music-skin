@@ -4,7 +4,8 @@
 # Left behind when the app is updated while it is running
 *.old.exe
 
-# The Mac version is kept out of this repository
-Music Player for Mac/
+# Made by tools/make-mac.ps1 for copying to a Mac (download the repository instead)
 Music Player for Mac.zip
-tools/make-mac.ps1
+
+# Finder
+.DS_Store

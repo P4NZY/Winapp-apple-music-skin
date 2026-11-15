@@ -238,8 +238,11 @@ function themeCss() {
   }).join('\n');
 }
 
+// all of the skin's styles: the themes, player.css, and the Mac's own extras
+function skinCss() { return themeCss() + '\n' + __MP_CSS + '\n' + MAC_CSS; }
+
 function installCss() {
-  var css = themeCss() + '\n' + __MP_CSS;
+  var css = skinCss();
   try {
     if (!sheet) { sheet = new CSSStyleSheet(); sheet.replaceSync(css); }
     if (document.adoptedStyleSheets.indexOf(sheet) < 0)
@@ -255,12 +258,18 @@ function installCss() {
 }
 
 function applyTheme() {
-  var root = document.documentElement;
-  if (!root) return;
-  var t = themeNow();
-  if (root.getAttribute('data-mp-theme') !== t.id) root.setAttribute('data-mp-theme', t.id);
-  if (root.getAttribute('data-mp-mode') !== S.mode) root.setAttribute('data-mp-mode', S.mode);
-  if (root.getAttribute('data-mp-host') !== HOST_KIND) root.setAttribute('data-mp-host', HOST_KIND);
+  var t = themeNow(), pin = floatOk() ? '1' : '0';
+  // the page's <html>, and the floating compact player's (Mac) when it is open
+  [document.documentElement, FLOAT.win && FLOAT.win.document.documentElement].forEach(function (root) {
+    if (!root) return;
+    if (root.getAttribute('data-mp-theme') !== t.id) root.setAttribute('data-mp-theme', t.id);
+    if (root.getAttribute('data-mp-mode') !== S.mode) root.setAttribute('data-mp-mode', S.mode);
+    if (root.getAttribute('data-mp-host') !== HOST_KIND) root.setAttribute('data-mp-host', HOST_KIND);
+    if (root.getAttribute('data-mp-pin') !== pin) root.setAttribute('data-mp-pin', pin);
+  });
+  // the page shows a plate saying where the player went while it floats
+  var root = document.documentElement, fl = FLOAT.win || FLOAT.opening ? '1' : '0';
+  if (root && root.getAttribute('data-mp-float') !== fl) root.setAttribute('data-mp-float', fl);
 }
 
 // Tell the app window how to paint its title bar. The displays are dark in
@@ -563,7 +572,7 @@ function setMarquee(text, force) {
   inner.classList.remove('scroll');
   inner.replaceChildren(first);
   if (!deckShown()) return;
-  requestAnimationFrame(function () {
+  nextFrame(function () {
     if (S.marquee !== text || first.offsetWidth <= ui.marquee.clientWidth - 4) return;
     var gap = '   ***   ';
     inner.appendChild(h('span', { text: gap }));
@@ -748,12 +757,12 @@ function vizColors() {
 }
 
 function kickViz() {
-  if (!viz.raf && deckShown() && S.seen && ui.viz) viz.raf = requestAnimationFrame(vizFrame);
+  if (!viz.raf && deckShown() && S.seen && ui.viz) viz.raf = nextFrame(vizFrame);
 }
 
 function vizFrame(now) {
   viz.raf = 0;
-  var c = ui.viz, dpr = window.devicePixelRatio || 1;
+  var c = ui.viz, dpr = drawWin().devicePixelRatio || 1;
   var w = Math.round(c.clientWidth * dpr), ht = Math.round(c.clientHeight * dpr);
   if (!deckShown() || !S.seen || !w || !ht) { viz.last = 0; return; }
   if (c.width !== w || c.height !== ht) { c.width = w; c.height = ht; }
@@ -798,7 +807,7 @@ function vizFrame(now) {
       g.fillRect(x, ht - (pr + 1) * (seg + segGap) + segGap, bwi, Math.max(1, Math.round(seg / 2)));
     }
   }
-  if (playing || energy > 0.02) viz.raf = requestAnimationFrame(vizFrame);
+  if (playing || energy > 0.02) viz.raf = nextFrame(vizFrame);
   else viz.last = 0;
 }
 
@@ -1625,8 +1634,8 @@ var VZ = {
   seed: Math.random() * 50, osdTimer: 0, idleTimer: 0, c1: [0.5, 0.8, 1], c2: [1, 0.8, 0.4]
 };
 
-function vzVisible() { return !!ui.vzPanel && S.showViz && deckShown() && S.seen && !document.hidden; }
-function vzKick() { if (!VZ.raf && vzVisible()) VZ.raf = requestAnimationFrame(vzFrame); }
+function vzVisible() { return !!ui.vzPanel && S.showViz && deckShown() && S.seen && !drawDoc().hidden; }
+function vzKick() { if (!VZ.raf && vzVisible()) VZ.raf = nextFrame(vzFrame); }
 
 function vzColors() {
   var t = themeNow(), a = hexToRgb(t.lcdFg), b = hexToRgb(t.lit);
@@ -1852,7 +1861,7 @@ function vzProgFor(fx) {
 function vzFrame(now) {
   VZ.raf = 0;
   if (!vzVisible()) return;
-  VZ.raf = requestAnimationFrame(vzFrame);
+  VZ.raf = nextFrame(vzFrame);
   if (now - VZ.last < 11.5) return;                   // 60 to 85 pictures a second, however fast the screen is
   var dt = VZ.last ? Math.min(0.1, (now - VZ.last) / 1000) : 0.016;
   VZ.last = now;
@@ -1880,7 +1889,7 @@ function vzFrame(now) {
 function vzSize() {
   var box = ui.vzScreen, cw = box.clientWidth, ch = box.clientHeight;
   if (cw < 8 || ch < 8) return null;
-  var k = Math.min(window.devicePixelRatio || 1, 1.5);
+  var k = Math.min(drawWin().devicePixelRatio || 1, 1.5);
   var w = Math.round(cw * k), h = Math.round(ch * k), over = (w * h) / 1400000;
   if (over > 1) { k = 1 / Math.sqrt(over); w = Math.round(w * k); h = Math.round(h * k); }
   var c = ui.vzCanvas;
@@ -2057,12 +2066,32 @@ function vzMenu(open) {
 // LIVE = drawing the real sound, DEMO = the built-in tune stands in
 function vzStatus() {
   if (!ui.vzSrc) return;
-  var m = AU.mode, failed = AU.tapState.lastIndexOf('failed', 0) === 0;
+  var m = AU.mode, ts = AU.tapState, failed = ts.lastIndexOf('failed', 0) === 0;
   ui.vzSrc.textContent = m === 'live' ? 'LIVE' : m === 'demo' ? 'DEMO' : '';
   ui.vzSrc.setAttribute('data-s', m);
   ui.vzSrc.title = m === 'live' ? 'Moving with the sound the app is playing'
-    : m === 'demo' ? 'The app cannot hear the music right now' + (failed ? ' (' + AU.tapState + ')' : '') + ', so a built-in animation is shown'
+    : m === 'demo' ? 'The app cannot hear the music right now' + (failed ? ' (' + ts + ')' : '') + ', so a built-in animation is shown'
     : '';
+  vzHintSync();
+}
+
+// Mac: the visualizer hears the music once the extension has been invoked on
+// the tab (its button in the toolbar; see background.js). Until then it says
+// so on the picture, over the built-in tune.
+function vzHintSync() {
+  if (!ui.vzHint) return;
+  var m = AU.mode, ts = AU.tapState, why = '';
+  if (HOST_KIND === 'mac' && m === 'demo' && !VZ.hintOff) {
+    if (ts === 'click') why = 'DEMO BEAT - to make it follow your music, click the Music Player button in the browser toolbar ' +
+      '(puzzle-piece menu if not pinned) while Apple Music is the tab in front. Once per visit.';
+    else if (ts === 'busy') why = 'DEMO BEAT - it is listening to Apple Music in another tab; only one tab can be heard at a time.';
+    else if (ts.lastIndexOf('failed', 0) === 0) why = 'DEMO BEAT - listening to the music did not work (' + ts.slice(7) + '). ' +
+      'Click the Music Player button in the browser toolbar to try again.';
+  }
+  ui.vzHintText.textContent = why;
+  ui.vzHint.title = why;
+  ui.vzHint.hidden = !why;
+  if (why) ui.vzSrc.title = why;
 }
 // big view: the strip of keys hides while the mouse rests
 function vzIdle(idle) {
@@ -2134,7 +2163,7 @@ var LY = {
 
 function lyVisible() { return !!ui.lyPanel && S.showLyr && deckShown(); }
 function lyKick() {
-  if (!LY.raf && lyVisible() && S.seen && LY.data && LY.data.synced && !document.hidden) LY.raf = requestAnimationFrame(lyFrame);
+  if (!LY.raf && lyVisible() && S.seen && LY.data && LY.data.synced && !drawDoc().hidden) LY.raf = nextFrame(lyFrame);
 }
 
 function ttTime(s) {                    // "5.932", "1:21.726", "1:02:03.5" -> seconds
@@ -2339,8 +2368,8 @@ function lySyncKeys() {
 // Follow the song: light the line being sung, fill its words, keep it in view.
 function lyFrame(now) {
   LY.raf = 0;
-  if (!lyVisible() || !S.seen || !LY.data || !LY.data.synced || document.hidden) return;
-  LY.raf = requestAnimationFrame(lyFrame);
+  if (!lyVisible() || !S.seen || !LY.data || !LY.data.synced || drawDoc().hidden) return;
+  LY.raf = nextFrame(lyFrame);
   if (now - LY.last < 30) return;
   LY.last = now;
   clockSample();
@@ -3259,9 +3288,9 @@ function placeMenu(x, y) {
   if (typeof x === 'number') { MENU.x = x; MENU.y = y; }
   box.style.left = '0px';
   box.style.top = '0px';
-  var w = box.offsetWidth, hgt = box.offsetHeight, pad = 8;
-  box.style.left = Math.max(pad, Math.min(MENU.x, window.innerWidth - w - pad)) + 'px';
-  box.style.top = Math.max(pad, Math.min(MENU.y, window.innerHeight - hgt - pad)) + 'px';
+  var w = box.offsetWidth, hgt = box.offsetHeight, pad = 8, win = drawWin();
+  box.style.left = Math.max(pad, Math.min(MENU.x, win.innerWidth - w - pad)) + 'px';
+  box.style.top = Math.max(pad, Math.min(MENU.y, win.innerHeight - hgt - pad)) + 'px';
 }
 
 // opts.play: what "Play" does for this row (left out where the song is playing already)
@@ -3796,6 +3825,199 @@ function onAuthChange() {
   lyRefresh(true);
 }
 
+// ============================================================================
+// Floating compact player (Mac)
+// A browser window cannot stay above other apps' windows, but a
+// Picture-in-Picture window can - and Chrome, Edge and Brave (116 and later)
+// can show a whole page in one (Document Picture-in-Picture). So on a Mac,
+// with "keep on top" on (the pin key; on by default there), the compact
+// player moves into one: it floats above every other window, the browser's
+// own included, whatever app is in front. Its parts are the same ones, moved
+// over and still driven from here; they come back when it closes. Meanwhile
+// the tab shows a plate saying where the player went. Closing the floating
+// window (or its "back to tab" key) brings back the full player.
+//
+// Only a click or a key press may open such a window. When the compact player
+// comes up by itself ("shrink when music starts", a while after the click), or
+// the browser cannot float a page, it is the ordinary compact window instead.
+// ============================================================================
+var FLOAT = { win: null, opening: false, gen: 0, resizeTimer: 0 };
+
+function floatOk() { return HOST_KIND === 'mac' && !!window.documentPictureInPicture; }
+// the window, and the page, the player is drawn in now
+function drawWin() { return FLOAT.win || window; }
+function drawDoc() { return FLOAT.win ? FLOAT.win.document : document; }
+
+// requestAnimationFrame in the window the player is in, with the time reckoned
+// as on this page (performance.now() here). A frame asked for before the
+// player moved is dropped: the loop starts again in the new window.
+function nextFrame(fn) {
+  var w = drawWin(), gen = FLOAT.gen, off = 0;
+  if (w !== window) { try { off = w.performance.timeOrigin - performance.timeOrigin; } catch (e) {} }
+  try { return w.requestAnimationFrame(function (t) { if (gen === FLOAT.gen) fn(t + off); }); }
+  catch (e) { return 0; }
+}
+
+// Open the floating window and move the player into it. False when that
+// cannot be done here and now (the ordinary compact window is used then).
+function floatOpen() {
+  if (FLOAT.win || FLOAT.opening) return true;
+  if (!floatOk() || (navigator.userActivation && !navigator.userActivation.isActive)) return false;
+  var size = compactSize(), p;
+  try { p = window.documentPictureInPicture.requestWindow({ width: size[0], height: size[1] }); }
+  catch (e) { dlog('floating player: ' + errText(e)); return false; }
+  FLOAT.opening = true;
+  applyTheme();
+  Promise.resolve(p).then(function (win) {
+    FLOAT.opening = false;
+    if (S.mode === 'compact' && S.onTop && !FLOAT.win) { floatMove(win); return; }
+    try { win.close(); } catch (e) {}                     // (changed meanwhile)
+    applyTheme();
+    if (S.mode === 'compact') requestCompactSize();
+  }, function (e) {
+    FLOAT.opening = false;
+    dlog('floating player refused: ' + errText(e));
+    applyTheme();
+    if (S.mode === 'compact') requestCompactSize();       // the ordinary compact window, then
+  });
+  return true;
+}
+
+function floatMove(win) {
+  var doc = win.document, css = skinCss();
+  FLOAT.win = win;
+  try {
+    var sheet = new win.CSSStyleSheet();
+    sheet.replaceSync(css);
+    doc.adoptedStyleSheets = [sheet];
+  } catch (e) {
+    var st = doc.createElement('style');
+    st.textContent = css;
+    doc.head.appendChild(st);
+  }
+  doc.title = 'Music Player';
+  doc.documentElement.setAttribute('data-mp-floating', '1');
+  applyTheme();
+  doc.body.appendChild(ui.root);
+  floatFresh();
+
+  win.addEventListener('keydown', onKey, true);
+  win.addEventListener('pointerdown', function (e) {
+    if (menuOpen() && ui.menu && !ui.menu.contains(e.target)) closeMenu();
+  }, true);
+  win.addEventListener('blur', function () { closeMenu(); });
+  win.addEventListener('resize', function () {
+    clearTimeout(FLOAT.resizeTimer);
+    FLOAT.resizeTimer = setTimeout(function () {
+      if (FLOAT.win === win && deckShown()) { setMarquee(S.marquee, true); kickViz(); vzKick(); }
+    }, 120);
+  });
+  doc.addEventListener('visibilitychange', function () {
+    if (FLOAT.win === win && !doc.hidden) { kickViz(); vzKick(); lyKick(); }
+  });
+  // closed by hand, or with its "back to tab" key: the full player, in the tab
+  win.addEventListener('pagehide', function () {
+    if (FLOAT.win !== win) return;                        // (closed from here: taken care of)
+    floatHome();
+    if (S.mode === 'compact') setMode('full');
+  });
+  dlog('floating player: ' + win.innerWidth + 'x' + win.innerHeight);
+}
+
+// After a move: fresh pictures for the two displays (a graphics context
+// belongs with its page), and the moving parts started again where the
+// player is now.
+function floatFresh() {
+  FLOAT.gen++;
+  viz.raf = VZ.raf = LY.raf = 0;
+  viz.last = VZ.last = 0;
+  if (ui.viz && ui.viz.parentNode) {
+    var c = h('canvas', { class: 'mpc-viz', 'aria-hidden': 'true' });
+    ui.viz.parentNode.replaceChild(c, ui.viz);
+    ui.viz = c;
+  }
+  if (VZ.gl) { try { var x = VZ.gl.getExtension('WEBGL_lose_context'); if (x) x.loseContext(); } catch (e) {} }
+  if (ui.vzCanvas && ui.vzCanvas.parentNode) vzNewCanvas();
+  closeMenu();
+  setTimeout(function () {
+    kickViz(); vzKick(); lyKick();
+    markCurrent(true);
+    if (deckShown()) setMarquee(S.marquee, true);
+  }, 60);
+}
+
+// The player back into the page (the floating window is going).
+function floatHome() {
+  var win = FLOAT.win;
+  FLOAT.win = null;
+  clearTimeout(FLOAT.resizeTimer);
+  if (document.body && ui.root) document.body.appendChild(ui.root);
+  applyTheme();
+  floatFresh();
+  return win;
+}
+
+// The player leaves the floating window (LIBRARY, Ctrl+M, the pin): close it,
+// and bring the tab - where the player is again - to the front.
+function floatClose(focusTab) {
+  if (!FLOAT.win) return false;
+  var win = floatHome();
+  try { win.close(); } catch (e) {}
+  if (focusTab) send('focus|1');
+  return true;
+}
+
+// The floating window as tall as what is open in it (as wide as it was left).
+// The browser allows that right after a click or key in it, which is when
+// the panels change.
+function floatFit(height) {
+  var w = FLOAT.win;
+  try { w.resizeTo(w.outerWidth, height + (w.outerHeight - w.innerHeight)); } catch (e) {}
+}
+
+// (safety net) the floating window went without saying so: the player comes home
+function floatCheck() {
+  if (FLOAT.win && FLOAT.win.closed) { floatHome(); if (S.mode === 'compact') setMode('full'); }
+}
+
+// Apple's page re-renders itself: keep our pieces in it (or in the floating window).
+function keepAttached() {
+  if (!document.body || !ui.root) return;
+  if (!ui.root.isConnected || (!FLOAT.win && ui.root.ownerDocument !== document)) document.body.appendChild(ui.root);
+  if (ui.away && !ui.away.isConnected) document.body.appendChild(ui.away);
+}
+
+// Styles for the Mac's extras (added after player.css).
+var MAC_CSS = [
+  '/* ---- Mac: the floating compact player, and the plate the tab shows meanwhile ---- */',
+  'html[data-mp-floating="1"] { color-scheme: dark; }',
+  'html[data-mp-floating="1"] body { margin: 0; }',
+  '#mp-away { display: none; }',
+  'html[data-mp-float="1"] #mp-away {',
+  '  position: fixed; inset: 0; z-index: 2147483601;',
+  '  display: grid; place-items: center; padding: 24px; overflow: auto;',
+  '  color: var(--mp-shell-text);',
+  '  background: var(--mp-shippo), linear-gradient(180deg, var(--mp-shell-a), var(--mp-shell-b));',
+  '  font-family: var(--mp-f-ui);',
+  '  -webkit-user-select: none; user-select: none;',
+  '}',
+  '.mpw-box { display: grid; justify-items: center; gap: 16px; width: min(440px, 100%); text-align: center; }',
+  '.mpw-brand { display: flex; align-items: center; gap: 9px; }',
+  '.mpw-lcd {',
+  '  display: grid; gap: 8px; width: 100%; padding: 18px 22px; border-radius: 8px;',
+  '  border: 1px solid var(--mp-edge); color: var(--mp-lcd-fg); background: var(--mp-lcd-bg);',
+  '  box-shadow: inset 0 2px 7px rgba(0, 0, 0, .65), 0 1px 0 var(--mp-hi);',
+  '}',
+  '.mpw-jp { font-size: 22px; letter-spacing: .3em; text-shadow: var(--mp-glow); }',
+  '.mpw-title { font: 700 13px/1.3 var(--mp-f-mono); letter-spacing: .18em; color: var(--mp-lcd-text); text-shadow: var(--mp-glow); }',
+  '.mpw-text { font: 12px/1.55 var(--mp-f-ui); color: var(--mp-lcd-soft); }',
+  '#mp-away .mpc-lib { height: 30px; padding: 0 14px; }',
+  '/* ---- Mac: how to let the visualizer hear the music ---- */',
+  '.mpv-hint { font-size: 10.5px; line-height: 1.4; max-height: calc(100% - 16px); overflow: hidden; }',
+  '.mpv-hint span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }',
+  '.mpv-note:not([hidden]) ~ .mpv-hint { top: auto; bottom: 8px; }'
+].join('\n');
+
 // ------------------------------------------------------------- actions -------
 var ACT = {
   full: function () { setMode('full'); },
@@ -3822,6 +4044,7 @@ var ACT = {
   vizauto: function () { vzSetAuto(!VZ.auto); vzOsd('自動', VZ.auto ? 'AUTO: NEW EFFECT EVERY 40 SECONDS' : 'AUTO OFF'); },
   vizbig: function () { setVizBig(!S.vizBig); },
   vizretry: function () { vzRetry(); },
+  vizhint: function () { VZ.hintOff = true; vzHintSync(); },
   lyrroma: function () { LY.roma = !LY.roma; store.set('lyrRoma', LY.roma); lySyncKeys(); lyBigLine(); },
   lyrtrans: function () { LY.trans = !LY.trans; store.set('lyrTrans', LY.trans); lySyncKeys(); lyBigLine(); },
   lyrretry: function () { lyRefresh(true); },
@@ -3887,7 +4110,13 @@ function setMode(mode) {
   applyTheme();
   notifyHost();
   closePanel();
-  if (mode === 'compact') requestCompactSize(); else send('compact|0');
+  if (mode === 'compact') {
+    // Mac, with "keep on top": a floating window of its own, if one can be had
+    if (!(S.onTop && floatOpen())) requestCompactSize();
+  } else {
+    floatClose(true);
+    send('compact|0');
+  }
 
   if (mode === 'apple') {
     send('tap|0');
@@ -3913,12 +4142,18 @@ function setMode(mode) {
 // deck with any of the three panels stacked under it.
 function requestCompactSize() {
   if (S.mode !== 'compact') return;
+  var size = compactSize();
+  if (FLOAT.win) { floatFit(size[1]); return; }
+  if (FLOAT.opening) return;
+  send('compact|1|' + size[0] + '|' + size[1]);
+}
+function compactSize() {
   var base = ui.strip.offsetHeight + ui.deck.offsetHeight;
   var n = (S.showViz ? 1 : 0) + (S.showLyr ? 1 : 0) + (S.showPl ? 1 : 0), height = base;
   if (n === 1 && S.showPl) height = COMPACT_H;
   else if (n) height = base + 10 + (n - 1) * 6 + (S.showViz ? CP_VIZ : 0) + (S.showLyr ? CP_LYR : 0) + (S.showPl ? CP_PL : 0);
   var room = (window.screen && screen.availHeight ? screen.availHeight : 900) - 56;
-  send('compact|1|' + COMPACT_W + '|' + Math.round(Math.max(base, Math.min(height, room))));
+  return [COMPACT_W, Math.round(Math.max(base, Math.min(height, room)))];
 }
 
 // Switch one of the panels on or off: 'viz', 'lyr' or 'pl' (the queue).
@@ -3962,6 +4197,11 @@ function setOnTop(on) {
     ui.pinBtn.setAttribute('aria-pressed', S.onTop ? 'true' : 'false');
   }
   syncPanel();
+  // Mac: the compact player floats now, or goes back to being the ordinary compact window
+  if (floatOk() && S.mode === 'compact') {
+    if (S.onTop && !FLOAT.win) { if (floatOpen()) send('compact|0'); }
+    else if (!S.onTop && floatClose(true)) requestCompactSize();
+  }
 }
 
 // --------------------------------------------------------------- build UI ----
@@ -4172,7 +4412,11 @@ function buildVizPanel() {
   ui.vzNoteText = h('span');
   ui.vzNote = h('div', { class: 'mpv-note', hidden: true }, ui.vzNoteText,
     h('button', { class: 'mp-key mpv-retry', type: 'button', 'data-act': 'vizretry', text: 'TRY AGAIN' }));
-  ui.vzScreen = h('div', { class: 'mpp-screen mpv-screen' }, ui.vzCanvas, ui.vzLyric, ui.vzOsd, ui.vzNote, ui.vzMenu);
+  // (Mac) how to let it hear the music, while it cannot
+  ui.vzHintText = h('span');
+  ui.vzHint = h('div', { class: 'mpv-note mpv-hint', hidden: true }, ui.vzHintText,
+    h('button', { class: 'mp-key mpv-retry', type: 'button', 'data-act': 'vizhint', title: 'Hide this until Apple Music is opened again', text: 'OK' }));
+  ui.vzScreen = h('div', { class: 'mpp-screen mpv-screen' }, ui.vzCanvas, ui.vzLyric, ui.vzOsd, ui.vzNote, ui.vzHint, ui.vzMenu);
   ui.vzSrc = h('span', { class: 'mpp-chip', 'data-s': 'idle' });
   ui.vzAuto = smallToggle('vizauto', 'AUTO', 'Move on to another effect every 40 seconds');
   var head = h('div', { class: 'mpp-head' },
@@ -4286,7 +4530,8 @@ function buildPanel() {
     h('span', { text: 'Shrink to the compact player when music starts' }),
     h('span', { class: 'mp-switch' }, h('i', { class: 'mp-led' }))));
   body.appendChild(h('button', { class: 'mp-opt', 'data-opt': 'onTop', type: 'button', role: 'switch', 'aria-checked': 'false' },
-    h('span', { text: 'Keep the compact player above everything - fullscreen browsers, and games set to windowed fullscreen' }),
+    h('span', { text: HOST_KIND === 'mac' ? 'Keep the compact player on top of other windows (it floats in a small window of its own, above every app)'
+      : 'Keep the compact player above everything - fullscreen browsers, and games set to windowed fullscreen' }),
     h('span', { class: 'mp-switch' }, h('i', { class: 'mp-led' }))));
   body.appendChild(h('div', { class: 'mp-hint' },
     h('span', { class: 'mp-kbd', text: 'Ctrl+M' }), h('span', { text: ' compact / full    ' }),
@@ -4374,7 +4619,25 @@ function buildUi() {
     var t = e.target, tag = (t && t.tagName) || '';
     if (tag !== 'INPUT' && tag !== 'TEXTAREA') e.preventDefault();
   });
+  // (Mac) what the tab shows while the compact player floats; stays in the page
+  if (floatOk()) ui.away = buildAway();
   vizColors();
+}
+
+function buildAway() {
+  var a = h('div', { id: 'mp-away', class: 'mp-ui' },
+    h('div', { class: 'mpw-box' },
+      h('div', { class: 'mpw-brand' },
+        __MP_ICON ? h('img', { class: 'mpc-logo', src: __MP_ICON, alt: '' }) : null,
+        h('span', { class: 'mpc-brand', text: 'MUSIC PLAYER' }), jp('ミュージックプレーヤー', 'mpc-brand-jp')),
+      h('div', { class: 'mpw-lcd' },
+        jp('最前面', 'mpw-jp'),                                                   // "frontmost"
+        h('div', { class: 'mpw-title', text: 'FLOATING ON TOP' }),
+        h('div', { class: 'mpw-text', text: 'The compact player is in its own small window, above all your other windows - ' +
+          'whatever app you are using. Close it, or press LIBRARY on it, to bring the player back here.' })),
+      textKey('full', 'BACK TO THE FULL PLAYER', 'ライブラリ', 'Bring the player back into this tab (Ctrl+M)', I.full)));
+  a.addEventListener('click', onActClick);
+  return a;
 }
 
 // ------------------------------------------------- apple face: housekeeping --
@@ -4382,7 +4645,7 @@ function buildUi() {
 // runs while Apple's pages are on screen.
 function placeControls() {
   if (!document.body || !ui.root) return;
-  if (!ui.root.isConnected) document.body.appendChild(ui.root);
+  keepAttached();
   if (S.mode !== 'apple') return;
 
   // Is Apple showing its sidebar (wide window) or a top bar (narrow window)?
@@ -4620,14 +4883,15 @@ whenBody(function () {
   setInterval(function () {
     installCss();
     applyTheme();
-    if (!ui.root.isConnected && document.body) document.body.appendChild(ui.root);
+    floatCheck();
+    keepAttached();
     if (deckShown()) { refreshState(); refreshTime(); vzKick(); lyRefresh(); lyKick(); }
   }, 1000);
 });
 
 // handy when poking around in DevTools (F12)
 window.__mp = {
-  state: S, themes: THEMES, db: DB, browser: B, setTheme: setTheme, setMode: setMode, go: go,
+  state: S, themes: THEMES, db: DB, browser: B, setTheme: setTheme, setMode: setMode, go: go, float: FLOAT,
   sound: AU, viz: VZ, effects: EFFECTS, lyrics: LY, clock: CK,
   setPanel: setPanel, setEffect: vzSet, setVizBig: setVizBig, vizRetry: vzRetry, setOnTop: setOnTop,
   parseTtml: parseTtml, fetchLyrics: lyFetch, showLyrics: lyShow, songIdsFrom: songIdsFrom
