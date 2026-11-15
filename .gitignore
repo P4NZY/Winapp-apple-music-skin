@@ -1,0 +1,10 @@
+# Made by build.ps1 for this PC (it points at this folder)
+*.lnk
+
+# Left behind when the app is updated while it is running
+*.old.exe
+
+# The Mac version is kept out of this repository
+Music Player for Mac/
+Music Player for Mac.zip
+tools/make-mac.ps1
