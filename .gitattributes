@@ -1,0 +1,4 @@
+# Text files keep Unix line endings on every computer: install.sh must have
+# them to run on a Mac, and tools/make-mac.ps1 then builds the same skin.js
+# wherever it is run.
+* text=auto eol=lf
