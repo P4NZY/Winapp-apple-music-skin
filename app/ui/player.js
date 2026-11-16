@@ -229,7 +229,9 @@ var sheet = null;
 
 // Themes of your own (see "Themes of your own" below): the saved ones, their
 // photos once read from storage, and the one being edited.
-var USER = { list: [], photos: {}, fonts: {}, dbP: null, draft: null, draftPhotoWas: '', draftFontWas: '', armTimer: 0, msgTimer: 0 };
+// (edArea: which part of the player the editor's picture controls are for;
+// draftKeysWas: the pictures the theme being edited had when it was opened.)
+var USER = { list: [], photos: {}, fonts: {}, dbP: null, draft: null, draftKeysWas: [], draftFontWas: '', edArea: 'app', measuring: {}, armTimer: 0, msgTimer: 0 };
 
 // The "Album cover" theme: its colours are worked out from the cover of the
 // song that is playing, and glide from one song's to the next (see "The cover").
@@ -311,6 +313,7 @@ function applyTheme() {
   var root = document.documentElement, fl = FLOAT.win || FLOAT.opening ? '1' : '0';
   if (root && root.getAttribute('data-mp-float') !== fl) root.setAttribute('data-mp-float', fl);
   applyPhoto(t);
+  applyAreas(t);
 }
 
 // Tell the app window how to paint its title bar. The displays are dark in
@@ -387,7 +390,31 @@ var PHOTO_KNOBS = [
   ['y', 'Up - down', 0, 100, 1, '%', 50],
   ['tint', 'Body colour over it', 0, 95, 1, '%', 35],
   ['blur', 'Blur', 0, 24, 1, 'px', 0],
-  ['glass', 'See-through displays', 0, 90, 1, '%', 25]
+  ['glass', 'See-through displays', 0, 90, 1, '%', 25],
+  ['bright', 'Brightness', 30, 170, 5, '%', 100],
+  ['sat', 'Colour strength', 0, 200, 5, '%', 100]
+];
+// The parts of the player that can have a picture of their own (each a
+// photo, a moving GIF or a video, laid out with the knobs above):
+//   app    behind the whole player (a theme's "photo", as it always was)
+//   mini   behind the compact player, instead of the whole player's
+//   top    the strip and the deck across the top
+//   nav    the library down the left (full player)
+//   list   the big list in the middle (full player)
+//   lyr    the lyrics display
+//   queue  the queue display
+// tint: what is laid over the picture - the body colour, or (on a display)
+// the display colour; glass: it has the "see-through displays" knob, for the
+// displays that sit on it. (The visualizer draws over all of its panel, so it
+// has none.)
+var AREAS = [
+  { k: 'app', en: 'WHOLE PLAYER', jp: '全体', tint: 'body', glass: true, say: 'Behind everything, in the full player and the compact one.' },
+  { k: 'mini', en: 'COMPACT', jp: 'コンパクト', tint: 'body', glass: true, say: 'Behind the compact player only, instead of the whole player\'s picture. Ctrl+M shows it.' },
+  { k: 'top', en: 'TOP', jp: '上部', tint: 'body', glass: true, say: 'The strip and the deck across the top: the clock, the song, the keys.' },
+  { k: 'nav', en: 'LIBRARY', jp: 'ライブラリ', tint: 'body', say: 'The library down the left. Full player only.' },
+  { k: 'list', en: 'LIST', jp: 'リスト', tint: 'lcd', say: 'The big list in the middle. Full player only.' },
+  { k: 'lyr', en: 'LYRICS', jp: '歌詞', tint: 'lcd', say: 'The lyrics display (LYR on the deck).' },
+  { k: 'queue', en: 'QUEUE', jp: '再生リスト', tint: 'lcd', say: 'The queue display (PL on the deck).' }
 ];
 var SKIN_FORMAT = 'music-player-skin';
 var PHOTO_MAX = 2560;             // longest side kept, in pixels (a large screen's worth)
@@ -395,7 +422,7 @@ var PHOTO_MAX = 2560;             // longest side kept, in pixels (a large scree
 // and a video are kept just as they are, up to these sizes.
 var ANIM_MAX = 30 * 1024 * 1024, VIDEO_MAX = 50 * 1024 * 1024;
 var FONT_MAX = 12 * 1024 * 1024;  // a font file inside a theme
-var SKIN_MAX = 100 * 1024 * 1024; // a skin file (what is inside it grows by a third on the way)
+var SKIN_MAX = 150 * 1024 * 1024; // a skin file (what is inside it grows by a third on the way)
 // Lettering a theme can pick. The named ones are fonts that Windows and macOS
 // both have, so a theme looks the same on the other computer; 'own' is the
 // font file kept inside the theme. Japanese falls through to the usual fonts.
@@ -424,13 +451,44 @@ function cleanName(s, d) {
   s = String(s === undefined || s === null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
   return s || d || 'My theme';
 }
-function cleanPhoto(p, key) {
+// (area: which part of the player it is for, for where the knobs start)
+function cleanPhoto(p, key, area) {
   // kind: still (a photo) | anim (a moving picture) | video
   var out = { key: key, kind: p.kind === 'anim' || p.kind === 'video' ? p.kind : 'still', fit: 'cover', thumb: '' }, i, k;
   for (i = 0; i < FITS.length; i++) if (FITS[i][0] === p.fit) out.fit = p.fit;
   if (out.kind === 'video' && out.fit === 'tile') out.fit = 'cover';      // (a video cannot be tiled)
-  for (i = 0; i < PHOTO_KNOBS.length; i++) { k = PHOTO_KNOBS[i]; out[k[0]] = limit(p[k[0]], k[2], k[3], k[6]); }
+  for (i = 0; i < PHOTO_KNOBS.length; i++) {
+    k = PHOTO_KNOBS[i];
+    out[k[0]] = limit(p[k[0]], k[2], k[3],
+      k[0] === 'tint' && areaInfo(area).tint === 'lcd' ? 55 :      // (a display wants more of its colour, for its lettering)
+      k[0] === 'glass' && area === 'mini' ? 45 :                    // (the compact player is mostly displays: let more of its picture through)
+      k[6]);
+  }
+  out.flip = p.flip === true;                              // mirrored, left to right
+  out.ratio = p.ratio > 0 ? limit(p.ratio, 0.05, 20, 0) : 0;      // width / height of the picture (0: not known yet)
   if (typeof p.thumb === 'string' && p.thumb.length < 60000 && /^data:image\/(jpeg|webp|png);base64,[A-Za-z0-9+\/=]+$/.test(p.thumb)) out.thumb = p.thumb;
+  return out;
+}
+function areaInfo(k) {
+  for (var i = 0; i < AREAS.length; i++) if (AREAS[i].k === k) return AREAS[i];
+  return AREAS[0];
+}
+// The picture a theme has for one part of the player (or null). The whole
+// player's is the theme's "photo", where it always was; the others are kept
+// under "areas".
+function areaPhoto(t, k) {
+  if (!t) return null;
+  return k === 'app' ? (t.photo || null) : (t.areas && t.areas[k]) || null;
+}
+function setAreaPhoto(t, k, p) {
+  if (k === 'app') { if (p) t.photo = p; else delete t.photo; return; }
+  if (p) { if (!t.areas) t.areas = {}; t.areas[k] = p; }
+  else if (t.areas) { delete t.areas[k]; if (!Object.keys(t.areas).length) delete t.areas; }
+}
+// every picture a theme keeps, as [part, picture]
+function themePhotos(t) {
+  var out = [];
+  AREAS.forEach(function (a) { var p = areaPhoto(t, a.k); if (p) out.push([a.k, p]); });
   return out;
 }
 // The lettering of a theme: { lcd, ui, own: { key, name } } - or null for the skin's own.
@@ -467,7 +525,16 @@ function cleanTheme(raw, keepId) {
     if (typeof raw[k] !== 'string' || !HEX.test(raw[k])) return null;
     t[k] = raw[k].toLowerCase();
   }
-  if (raw.photo && typeof raw.photo === 'object' && /^p-[a-z0-9]{6,16}$/.test(raw.photo.key)) t.photo = cleanPhoto(raw.photo, raw.photo.key);
+  if (raw.photo && typeof raw.photo === 'object' && /^p-[a-z0-9]{6,16}$/.test(raw.photo.key)) t.photo = cleanPhoto(raw.photo, raw.photo.key, 'app');
+  // the other parts' pictures: only the parts there are, each picture once
+  var used = {};
+  if (t.photo) used[t.photo.key] = true;
+  if (raw.areas && typeof raw.areas === 'object') AREAS.forEach(function (a) {
+    var p = a.k === 'app' ? null : raw.areas[a.k];
+    if (!p || typeof p !== 'object' || typeof p.key !== 'string' || !/^p-[a-z0-9]{6,16}$/.test(p.key) || used[p.key]) return;
+    used[p.key] = true;
+    setAreaPhoto(t, a.k, cleanPhoto(p, p.key, a.k));
+  });
   var f = cleanFont(raw.font);
   if (f) t.font = f;
   return t;
@@ -487,6 +554,7 @@ function saveUserThemes() {
     var o = { id: t.id, name: t.name };
     COLOURS.forEach(function (c) { o[c[0]] = t[c[0]]; });
     if (t.photo) o.photo = t.photo;
+    if (t.areas) o.areas = t.areas;
     if (t.font) o.font = t.font;
     return o;
   }));
@@ -529,6 +597,7 @@ function loadPhoto(key) {
     if (!blob) { dlog('theme photo ' + key + ' is not in the storage'); return; }
     USER.photos[key] = { url: URL.createObjectURL(blob), blob: blob, saved: true };
     applyTheme();
+    if (USER.draft) editFrame();
   }, function (e) { dlog('theme photos cannot be read: ' + errText(e)); });
 }
 function dropPhoto(key) {
@@ -586,14 +655,21 @@ function dropFont(key) {
 // so it goes along when the player moves to the Mac's floating window. A
 // video cannot be a CSS background, so that one is an element of its own
 // (ui.bgv), laid out by the same variables.
-var PHOTO_VARS = ['--mp-photo', '--mp-photo-x', '--mp-photo-y', '--mp-photo-k', '--mp-photo-tint', '--mp-photo-blur', '--mp-glass'];
+var PHOTO_VARS = ['--mp-photo', '--mp-photo-x', '--mp-photo-y', '--mp-photo-k', '--mp-photo-tint', '--mp-photo-blur', '--mp-glass', '--mp-photo-fx', '--mp-photo-flip'];
+// the colour knobs of a picture, as a CSS filter
+function photoFilter(p) {
+  return 'brightness(' + ((p.bright || 100) / 100).toFixed(2) + ') saturate(' + ((p.sat === 0 ? 0 : p.sat || 100) / 100).toFixed(2) + ')';
+}
 function applyPhoto(t) {
   var app = ui.app;
   if (!app) return;
-  var p = (t.user || t.live) ? t.photo : null, rec = p ? USER.photos[p.key] : null;
+  // the compact player can have a picture of its own
+  var p = (t.user || t.live) ? ((S.mode === 'compact' && areaPhoto(t, 'mini')) || t.photo) : null, rec = p ? USER.photos[p.key] : null;
   if (p && !rec) loadPhoto(p.key);                       // not read yet: it arrives in a moment
   var on = !!(p && rec && rec.url), video = on && p.kind === 'video';
-  var vals = on ? [video ? 'none' : 'url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', (1 - p.glass / 100).toFixed(2)] : null;
+  // mirrored: about the middle of the player, so the same part of the picture shows
+  var vals = on ? [video ? 'none' : 'url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', (1 - p.glass / 100).toFixed(2),
+    photoFilter(p), p.flip ? (p.fit === 'tile' ? 'scaleX(-1)' : 'translateX(' + (100 - 2 * p.x) + '%) scaleX(-1)') : 'scaleX(1)'] : null;
   var sig = on ? p.fit + '|' + p.kind + '|' + rec.url + '|' + vals.join('|') : '';
   if (app.__mpPhoto === sig) { bgvSync(); return; }
   app.__mpPhoto = sig;
@@ -606,6 +682,57 @@ function applyPhoto(t) {
     app.removeAttribute('data-photo-kind');
   }
   bgVideo(video ? rec.url : '');
+}
+
+// The pictures for parts of the player: a layer in each part (built with the
+// player, ui.ar), under what the part shows - see player.css, "pictures for
+// parts of the player". #mp-app carries data-ar-<part> for each part that has
+// one, so the part's own colours can step aside.
+var AR_VARS = ['--ar-pic', '--ar-x', '--ar-y', '--ar-k', '--ar-tint', '--ar-b', '--ar-fx'];
+function applyAreas(t) {
+  if (!ui.app || !ui.ar) return;
+  var own = !!(t.user || t.live), glass = '';
+  Object.keys(ui.ar).forEach(function (k) {
+    var layer = ui.ar[k], p = own ? areaPhoto(t, k) : null, rec = p ? USER.photos[p.key] : null, on, video, vals, sig;
+    if (p && !rec) loadPhoto(p.key);
+    on = !!(p && rec && rec.url);
+    video = on && p.kind === 'video';
+    vals = on ? [video ? 'none' : 'url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', photoFilter(p)] : null;
+    if (on && k === 'top') glass = (1 - p.glass / 100).toFixed(2);
+    sig = on ? [p.fit, p.kind, p.flip ? 1 : 0, rec.url].concat(vals).join('|') : '';
+    if (layer.__mpSig === sig) return;
+    layer.__mpSig = sig;
+    AR_VARS.forEach(function (name, i) { if (vals) layer.style.setProperty(name, vals[i]); else layer.style.removeProperty(name); });
+    layer.setAttribute('data-on', on ? '1' : '0');
+    layer.setAttribute('data-fit', on ? p.fit : '');
+    layer.setAttribute('data-kind', on ? p.kind : '');
+    layer.setAttribute('data-flip', on && p.flip ? '1' : '0');
+    if (on) ui.app.setAttribute('data-ar-' + k, p.kind); else ui.app.removeAttribute('data-ar-' + k);
+    arVideo(layer, video ? rec.url : '');
+  });
+  if (ui.app.style.getPropertyValue('--mp-glass-top') !== glass) {
+    if (glass) ui.app.style.setProperty('--mp-glass-top', glass); else ui.app.style.removeProperty('--mp-glass-top');
+  }
+  bgvSync();
+}
+// a part's picture is a <div> with it as its background, or a <video>
+function arVideo(layer, url) {
+  var pic = layer.firstElementChild, v;
+  if (!url) {
+    if (pic && pic.tagName === 'VIDEO') {
+      try { pic.pause(); pic.removeAttribute('src'); pic.load(); } catch (e) {}
+      layer.replaceChild(h('div', { class: 'mp-ar-pic' }), pic);
+    }
+    return;
+  }
+  if (!pic || pic.tagName !== 'VIDEO') {
+    v = h('video', { class: 'mp-ar-pic', 'aria-hidden': 'true', tabindex: '-1', muted: true, loop: true, playsinline: true, disablepictureinpicture: true, preload: 'auto' });
+    v.muted = true;                                      // never any sound
+    v.loop = true;
+    if (pic) layer.replaceChild(v, pic); else layer.appendChild(v);
+    pic = v;
+  }
+  if (pic.getAttribute('src') !== url) pic.setAttribute('src', url);
 }
 function bgVideo(url) {
   var v = ui.bgv;
@@ -625,13 +752,21 @@ function bgVideo(url) {
   if (v.getAttribute('src') !== url) v.setAttribute('src', url);
   bgvSync();
 }
-// it plays only while the player is in sight
+// A video plays only while the player is in sight - and, in a part of the
+// player, while that part is there at all (a panel can be switched off, the
+// library and the list are not in the compact player).
 function bgvSync() {
-  var v = ui.bgv, pr;
-  if (!v) return;
-  if (S.seen && deckShown()) {
-    if (v.paused) { try { pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
-  } else if (!v.paused) { try { v.pause(); } catch (e) {} }
+  var all = [], pr;
+  if (ui.bgv) all.push(ui.bgv);
+  if (ui.ar) Object.keys(ui.ar).forEach(function (k) {
+    var pic = ui.ar[k].firstElementChild;
+    if (pic && pic.tagName === 'VIDEO') all.push(pic);
+  });
+  all.forEach(function (v) {
+    if (S.seen && deckShown() && v.getClientRects().length) {
+      if (v.paused) { try { pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
+    } else if (!v.paused) { try { v.pause(); } catch (e) {} }
+  });
 }
 
 // A picture file -> what a theme keeps: the picture no bigger than a large
@@ -643,8 +778,8 @@ function readPhoto(file, keep) {
   if (file.size > 60 * 1024 * 1024) return Promise.reject(new Error('That picture is too big (over 60 MB)'));
   return createImageBitmap(file).then(function (bmp) {
     var k = Math.min(1, PHOTO_MAX / Math.max(bmp.width, bmp.height));
-    var thumb = thumbOf(bmp, bmp.width, bmp.height);
-    if (keep && k === 1 && file.type === 'image/webp') { if (bmp.close) bmp.close(); return { blob: file, thumb: thumb }; }
+    var thumb = thumbOf(bmp, bmp.width, bmp.height), ratio = bmp.width / bmp.height;
+    if (keep && k === 1 && file.type === 'image/webp') { if (bmp.close) bmp.close(); return { blob: file, thumb: thumb, ratio: ratio }; }
     var c = document.createElement('canvas');
     c.width = Math.max(1, Math.round(bmp.width * k));
     c.height = Math.max(1, Math.round(bmp.height * k));
@@ -652,16 +787,18 @@ function readPhoto(file, keep) {
     if (bmp.close) bmp.close();
     return new Promise(function (ok, no) {
       c.toBlob(function (blob) {
-        if (blob) ok({ blob: blob, thumb: thumb }); else no(new Error('That picture could not be prepared'));
+        if (blob) ok({ blob: blob, thumb: thumb, ratio: ratio }); else no(new Error('That picture could not be prepared'));
       }, 'image/webp', 0.9);
     });
   }, function () { throw new Error('That picture could not be read (try a JPEG or a PNG)'); });
 }
-// the tiny picture shown in the list of themes and in the editor
+// The tiny picture shown in the list of themes and in the editor: all of the
+// picture, no more than 200 x 120.
 function thumbOf(src, w, h0) {
-  var th = document.createElement('canvas'), tk = Math.max(180 / w, 72 / h0);
-  th.width = 180; th.height = 72;
-  th.getContext('2d').drawImage(src, (180 - w * tk) / 2, (72 - h0 * tk) / 2, w * tk, h0 * tk);
+  var th = document.createElement('canvas'), tk = Math.min(200 / w, 120 / h0);
+  th.width = Math.max(1, Math.round(w * tk));
+  th.height = Math.max(1, Math.round(h0 * tk));
+  th.getContext('2d').drawImage(src, 0, 0, th.width, th.height);
   return th.toDataURL('image/jpeg', 0.72);
 }
 
@@ -677,9 +814,9 @@ function readBackground(file, keep) {
     if (!moving) return readPhoto(file, keep).then(function (r) { r.kind = 'still'; return r; });
     if (file.size > ANIM_MAX) throw new Error('That moving picture is too big (over 30 MB)');
     return createImageBitmap(file).then(function (bmp) {
-      var thumb = thumbOf(bmp, bmp.width, bmp.height);
+      var thumb = thumbOf(bmp, bmp.width, bmp.height), ratio = bmp.width / bmp.height;
       if (bmp.close) bmp.close();
-      return { blob: file, thumb: thumb, kind: 'anim' };
+      return { blob: file, thumb: thumb, kind: 'anim', ratio: ratio };
     }, function () { throw new Error('That picture could not be read'); });
   });
 }
@@ -704,9 +841,10 @@ function readVideo(file) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      var ratio = v.videoWidth && v.videoHeight ? v.videoWidth / v.videoHeight : 0;
       try { v.removeAttribute('src'); v.load(); } catch (e) {}
       try { URL.revokeObjectURL(url); } catch (e) {}
-      if (thumb) ok({ blob: file, thumb: thumb, kind: 'video' });
+      if (thumb) ok({ blob: file, thumb: thumb, kind: 'video', ratio: ratio });
       else no(new Error('That video cannot be played here (an MP4 or a WebM works best)'));
     }
     function snap() {
@@ -741,12 +879,13 @@ function photoBlob(key) {
   var rec = USER.photos[key];
   return rec && rec.blob ? Promise.resolve(rec.blob) : photoGet(key);
 }
-// The .mpskin file for a theme: its name, colours and photo in one piece.
+// The .mpskin file for a theme: its name, colours and pictures in one piece.
 // version 1: colours and a photo. version 2: also a moving picture or a video
-// behind the player, and lettering (a theme that uses neither stays version 1,
-// so it still opens in a Music Player that has not been updated).
+// behind the player, and lettering. version 3: also pictures for parts of the
+// player ("areas"). A theme is written with the lowest version it needs, so a
+// plain one still opens in a Music Player that has not been updated.
 function skinFile(t) {
-  var out = { format: SKIN_FORMAT, version: 1, name: t.name, colors: {} }, ready = Promise.resolve(), big = [];
+  var out = { format: SKIN_FORMAT, version: 1, name: t.name, colors: {} }, ready = Promise.resolve(), big = [], bytes = 0;
   // the big pieces (a video can be tens of megabytes) are put into the text
   // afterwards, at a marker, instead of being copied through JSON.stringify
   function later(b64) {
@@ -755,26 +894,38 @@ function skinFile(t) {
     return mark;
   }
   COLOURS.forEach(function (c) { out.colors[c[0]] = t[c[0]]; });
-  if (t.photo) {
-    ready = photoBlob(t.photo.key).then(function (blob) {
-      if (!blob) return null;                              // (its photo is gone: the colours still travel)
+  themePhotos(t).forEach(function (x) {
+    var k = x[0], ph = x[1];
+    ready = ready.then(function () { return photoBlob(ph.key); }).then(function (blob) {
+      if (!blob) return null;                              // (its picture is gone: the rest still travels)
+      bytes += blob.size;
+      if (bytes * 4 / 3 > SKIN_MAX - 1024 * 1024)
+        throw new Error('its pictures are too big to go into one file (over ' + Math.round((SKIN_MAX * 3 / 4) / 1048576) + ' MB together) - use smaller ones');
       return blobToBase64(blob).then(function (b64) {
-        var p = { type: blob.type || 'image/webp', kind: t.photo.kind || 'still', fit: t.photo.fit };
-        PHOTO_KNOBS.forEach(function (k) { p[k[0]] = t.photo[k[0]]; });
+        var p = { type: blob.type || 'image/webp', kind: ph.kind || 'still', fit: ph.fit, flip: !!ph.flip };
+        PHOTO_KNOBS.forEach(function (n) { p[n[0]] = ph[n[0]]; });
+        if (ph.ratio) p.ratio = Math.round(ph.ratio * 10000) / 10000;
         p.data = later(b64);
-        out.photo = p;
-        if (p.kind !== 'still') out.version = 2;
+        if (k === 'app') {
+          out.photo = p;
+          if (p.kind !== 'still') out.version = Math.max(out.version, 2);
+        } else {
+          if (!out.areas) out.areas = {};
+          out.areas[k] = p;
+          out.version = 3;
+        }
       });
     });
-  }
+  });
   if (t.font) {
     ready = ready.then(function () {
       var f = { lcd: t.font.lcd, ui: t.font.ui };
       out.font = f;
-      out.version = 2;
+      out.version = Math.max(out.version, 2);
       if (!t.font.own) return null;
       return fontBlob(t.font.own.key).then(function (blob) {
         if (!blob) { if (f.lcd === 'own') f.lcd = ''; if (f.ui === 'own') f.ui = ''; return null; }
+        bytes += blob.size;
         return blobToBase64(blob).then(function (b64) { f.own = { name: t.font.own.name, type: blob.type || 'font/ttf', data: later(b64) }; });
       });
     });
@@ -838,12 +989,12 @@ function importSkin(file) {
   if (!file) return Promise.reject(new Error('No file was chosen'));
   if (file.size > SKIN_MAX) return Promise.reject(new Error('That file is too big to be a skin'));
   return file.text().then(function (txt) {
-    var d = null, raw, t, ph, fo, blob = null, fblob = null, fkey = '', trouble = [], bg, ft;
+    var d = null, raw, t, fo, fblob = null, fkey = '', trouble = [], bg, ft, blobs = {};
     try { d = JSON.parse(txt); } catch (e) {}
     txt = '';
     if (!d || typeof d !== 'object' || d.format !== SKIN_FORMAT || !d.colors || typeof d.colors !== 'object')
       throw new Error('That is not a Music Player skin file');
-    if (+d.version > 2) throw new Error('That skin was made with a newer Music Player - update this one first');
+    if (+d.version > 3) throw new Error('That skin was made with a newer Music Player - update this one first');
     raw = { name: d.name };
     COLOURS.forEach(function (c) { raw[c[0]] = d.colors[c[0]]; });
     fo = d.font && typeof d.font === 'object' ? d.font : null;
@@ -855,22 +1006,33 @@ function importSkin(file) {
     if (!t) throw new Error('That skin file is damaged (its colours cannot be read)');
     t.name = freeName(t.name);
 
-    // what is behind the player: through the same door as a file chosen here,
-    // so it must really be a picture or a video this browser can show
-    ph = d.photo;
-    bg = Promise.resolve(null);
-    if (ph && typeof ph === 'object' && typeof ph.data === 'string' && /^(image\/(webp|jpeg|png|gif|apng|avif)|video\/[a-z0-9.+-]{2,30})$/.test(ph.type)) {
-      try { blob = b64ToBlob(ph.data, ph.type); } catch (e) { blob = null; }
-      ph.data = '';
-      bg = !blob ? Promise.resolve(null) : readBackground(blob, true).then(function (r) {
-        t.photo = cleanPhoto(ph, newId('p-'));
-        t.photo.kind = r.kind;
-        if (r.kind === 'video' && t.photo.fit === 'tile') t.photo.fit = 'cover';
-        t.photo.thumb = r.thumb;
-        return r.blob;
-      }, function () { return null; });
-      bg = bg.then(function (b) { if (!b) trouble.push('ITS PICTURE COULD NOT BE READ'); return b; });
-    }
+    // the pictures - behind the player, and for parts of it: through the same
+    // door as a file chosen here, so each must really be a picture or a video
+    // this browser can show. One after another (they can be big).
+    bg = Promise.resolve();
+    AREAS.forEach(function (a) {
+      var ph = a.k === 'app' ? d.photo : (d.areas && typeof d.areas === 'object' ? d.areas[a.k] : null), blob = null;
+      if (!ph || typeof ph !== 'object') return;
+      if (typeof ph.data !== 'string' || !/^(image\/(webp|jpeg|png|gif|apng|avif)|video\/[a-z0-9.+-]{2,30})$/.test(ph.type)) {
+        trouble.push(a.k === 'app' ? 'ITS PICTURE COULD NOT BE READ' : 'ITS PICTURE FOR THE ' + a.en + ' COULD NOT BE READ');
+        return;
+      }
+      bg = bg.then(function () {
+        try { blob = b64ToBlob(ph.data, ph.type); } catch (e) { blob = null; }
+        ph.data = '';
+        return blob ? readBackground(blob, true) : Promise.reject(new Error('no picture'));
+      }).then(function (r) {
+        var p = cleanPhoto(ph, newId('p-'), a.k);
+        p.kind = r.kind;                                   // (what it turned out to be, not what the file says)
+        if (r.kind === 'video' && p.fit === 'tile') p.fit = 'cover';
+        p.thumb = r.thumb;
+        if (r.ratio) p.ratio = limit(r.ratio, 0.05, 20, 0);
+        setAreaPhoto(t, a.k, p);
+        blobs[a.k] = r.blob;
+      }, function () {
+        trouble.push(a.k === 'app' ? 'ITS PICTURE COULD NOT BE READ' : 'ITS PICTURE FOR THE ' + a.en + ' COULD NOT BE READ');
+      });
+    });
 
     // its own font: it must load as a font
     ft = Promise.resolve(null);
@@ -885,18 +1047,23 @@ function importSkin(file) {
         return null;
       });
     }
-    return bg.then(function (b) {
-      return ft.then(function (fb) { return addTheme(t, b, trouble.join(', '), fb); });
+    return bg.then(function () {
+      return ft.then(function (fb) { return addTheme(t, blobs, trouble.join(', '), fb); });
     });
   });
 }
-function addTheme(t, blob, trouble, fblob) {
-  var done = Promise.resolve(), key = t.photo ? t.photo.key : '', fkey = t.font && t.font.own ? t.font.own.key : '';
-  if (key && blob) {
+// A new theme in the list, with its pictures ({ part: blob }) and font file.
+function addTheme(t, blobs, trouble, fblob) {
+  var done = Promise.resolve(), fkey = t.font && t.font.own ? t.font.own.key : '';
+  themePhotos(t).forEach(function (x) {
+    var k = x[0], key = x[1].key, blob = blobs && blobs[k];
+    if (!blob) { setAreaPhoto(t, k, null); return; }
     USER.photos[key] = { url: URL.createObjectURL(blob), blob: blob, saved: false };
-    done = photoPut(key, blob).then(function () { USER.photos[key].saved = true; },
-      function (e) { trouble = 'ITS PICTURE WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
-  } else delete t.photo;
+    done = done.then(function () {
+      return photoPut(key, blob).then(function () { USER.photos[key].saved = true; },
+        function (e) { trouble = 'ITS PICTURES WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+    });
+  });
   if (fkey && fblob) {
     done = done.then(function () {
       return photoPut(fkey, fblob).then(function () { if (USER.fonts[fkey]) USER.fonts[fkey].saved = true; },
@@ -916,7 +1083,7 @@ function deleteTheme(id) {
   if (!t) return;
   USER.list = USER.list.filter(function (x) { return x.id !== id; });
   saveUserThemes();
-  if (t.photo) dropPhoto(t.photo.key);
+  themePhotos(t).forEach(function (x) { dropPhoto(x[1].key); });
   if (t.font && t.font.own) dropFont(t.font.own.key);
   renderUserThemes();
   if (S.theme === id) setTheme(store.get('themeBase', 'midnight')); else syncPanel();
@@ -934,21 +1101,28 @@ function editOpen(id) {
   }
   if (!d) return;
   USER.draft = d;
-  USER.draftPhotoWas = src && src.photo ? src.photo.key : '';
+  USER.draftKeysWas = src ? themePhotos(src).map(function (x) { return x[1].key; }) : [];
   USER.draftFontWas = src && src.font && src.font.own ? src.font.own.key : '';
+  // the picture controls start on the whole player - or, when only parts of
+  // it have pictures, on the first of those
+  USER.edArea = src && !src.photo && themePhotos(src).length ? themePhotos(src)[0][0] : 'app';
   closePanel();
   editSay('');
   editFill();
   ui.editor.setAttribute('data-open', '1');
   document.documentElement.setAttribute('data-mp-edit', '1');
   retheme();
-  setTimeout(relayout, 60);
+  requestCompactSize();                // (the compact window makes room for the editor beside it)
+  setTimeout(function () { relayout(); editFrame(); }, 60);
 }
 function editHide() {
   if (ui.editor) ui.editor.setAttribute('data-open', '0');
   document.documentElement.removeAttribute('data-mp-edit');
+  requestCompactSize();
   setTimeout(relayout, 60);
 }
+function editing() { return !!ui.editor && ui.editor.getAttribute('data-open') === '1'; }
+var EDIT_W = 332;                      // the editor's width (player.css: #mp-editor)
 // what the editor's controls show, from the theme being edited
 function editFill() {
   var d = USER.draft, ed = ui.editor, els, i, k, p;
@@ -959,29 +1133,206 @@ function editFill() {
   els = ed.querySelectorAll('[data-hx]');
   for (i = 0; i < els.length; i++) { els[i].value = d[els[i].getAttribute('data-hx')]; els[i].removeAttribute('data-bad'); }
   editFonts();
-  p = d.photo || null;
-  ui.edThumb.style.backgroundImage = p && p.thumb ? 'url("' + p.thumb + '")' : 'none';
-  ui.edThumb.setAttribute('data-has', p ? '1' : '0');
-  ui.edThumb.setAttribute('data-kind', p ? p.kind : '');
+  editAreas();
+  p = edPhoto();
+  k = areaInfo(USER.edArea);
+  ui.edAreaSay.textContent = k.en + ': ' + k.say;
   ui.edNoPhoto.hidden = !p;
   ui.edOpts.hidden = !p;
+  editFrame();
   if (!p) return;
   els = ed.querySelectorAll('[data-fit]');
   for (i = 0; i < els.length; i++) {
     els[i].setAttribute('aria-pressed', els[i].getAttribute('data-fit') === p.fit ? 'true' : 'false');
     els[i].disabled = p.kind === 'video' && els[i].getAttribute('data-fit') === 'tile';     // (a video cannot be tiled)
   }
-  els = ed.querySelectorAll('[data-p]');
+  ui.edFlip.setAttribute('aria-pressed', p.flip ? 'true' : 'false');
+  // the knobs this part has, and what is laid over its picture
+  els = ed.querySelectorAll('[data-row]');
+  for (i = 0; i < els.length; i++) {
+    if (els[i].getAttribute('data-row') === 'glass') els[i].hidden = !k.glass;
+    if (els[i].getAttribute('data-row') === 'tint') {
+      els[i].querySelector('.mpe-label').textContent = k.tint === 'lcd' ? 'Display colour' : 'Body colour';
+      els[i].title = 'How much of the ' + (k.tint === 'lcd' ? 'display' : 'body') + ' colour lies over the picture (more: the lettering reads better)';
+    }
+  }
+  editKnobs(true);
+}
+// the picture of the part being edited (or null)
+function edPhoto() { return USER.draft ? areaPhoto(USER.draft, USER.edArea) : null; }
+// the sliders and the framer, from the picture (quiet: the player is not repainted)
+function editKnobs(quiet) {
+  var p = edPhoto(), els, i;
+  if (!p || !ui.editor) return;
+  els = ui.editor.querySelectorAll('[data-p]');
   for (i = 0; i < els.length; i++) els[i].value = p[els[i].getAttribute('data-p')];
   editVals();
+  editFrame();
+  if (!quiet) applyTheme();
 }
 // the numbers beside the sliders
 function editVals() {
-  var p = USER.draft && USER.draft.photo, els = ui.editor.querySelectorAll('[data-v]'), i, j, k;
+  var p = edPhoto(), els = ui.editor.querySelectorAll('[data-v]'), i, j, k;
   for (i = 0; i < els.length; i++) {
     k = els[i].getAttribute('data-v');
     for (j = 0; j < PHOTO_KNOBS.length; j++) if (PHOTO_KNOBS[j][0] === k) els[i].textContent = p ? p[k] + PHOTO_KNOBS[j][5] : '';
   }
+}
+// The parts of the player, on the keys and on the little map: which one is
+// being edited, which have a picture (a lamp, and the picture itself).
+function editAreas() {
+  var d = USER.draft, els, i, k, p, whole;
+  if (!d || !ui.editor) return;
+  els = ui.editor.querySelectorAll('[data-area]');
+  for (i = 0; i < els.length; i++) {
+    k = els[i].getAttribute('data-area');
+    p = areaPhoto(d, k);
+    els[i].setAttribute('aria-pressed', k === USER.edArea ? 'true' : 'false');
+    els[i].setAttribute('data-has', p ? '1' : '0');
+    if (els[i].classList.contains('mpe-reg')) els[i].style.backgroundImage = p && p.thumb ? 'url("' + p.thumb + '")' : '';
+  }
+  whole = areaPhoto(d, 'app');
+  ui.edMap.style.backgroundImage = whole && whole.thumb ? 'url("' + whole.thumb + '")' : '';
+}
+
+// ---- the framer: all of the picture, with the point it is placed by (x, y)
+//      and - when it fills its part - a frame around what shows of it there.
+//      Drag on it to move that point, scroll on it to zoom. ----
+function editFrame() {
+  var fr = ui.edFrame, p = edPhoto(), rec, src, w, hh, img, box, vf;
+  if (!fr) return;
+  fr.setAttribute('data-has', p ? '1' : '0');
+  fr.setAttribute('data-kind', p ? p.kind : '');
+  ui.edAim.hidden = ui.edView.hidden = true;
+  if (!p) { fr.style.backgroundImage = ''; return; }
+  rec = USER.photos[p.key];
+  src = p.kind !== 'video' && rec && rec.url ? rec.url : p.thumb;      // (a moving picture moves here too)
+  fr.style.backgroundImage = src ? 'url("' + src + '")' : '';
+  if (!p.ratio) frameRatio(p, rec);
+  w = fr.clientWidth;
+  hh = fr.clientHeight;
+  if (!w || !hh) return;
+  img = frameImage(p, w, hh);
+  ui.edAim.style.left = (img.x + img.w * p.x / 100).toFixed(1) + 'px';
+  ui.edAim.style.top = (img.y + img.h * p.y / 100).toFixed(1) + 'px';
+  ui.edAim.hidden = false;
+  box = p.fit === 'cover' && p.ratio ? areaBox(USER.edArea) : null;
+  vf = box ? viewOf(p, box[0], box[1]) : null;
+  if (!vf) return;
+  ui.edView.style.left = (img.x + vf.x * img.w).toFixed(1) + 'px';
+  ui.edView.style.top = (img.y + vf.y * img.h).toFixed(1) + 'px';
+  ui.edView.style.width = (vf.w * img.w).toFixed(1) + 'px';
+  ui.edView.style.height = (vf.h * img.h).toFixed(1) + 'px';
+  ui.edView.hidden = false;
+}
+// where the picture sits in the framer (shown whole, in the middle)
+function frameImage(p, w, hh) {
+  var r = p.ratio || w / hh, iw, ih;
+  if (w / hh > r) { ih = hh; iw = hh * r; } else { iw = w; ih = w / r; }
+  return { x: (w - iw) / 2, y: (hh - ih) / 2, w: iw, h: ih };
+}
+// The part of a picture (as fractions of it) that shows in a part of the
+// player W x H, when it fills it (FILL): drawn as big as it takes to cover the
+// part (and the blur's margin round it), then zoomed by its size about the
+// point (x, y) - as player.css does it.
+function viewOf(p, W, H) {
+  var r = p.ratio, k = p.size / 100, m = 2.5 * p.blur, LW = W + 2 * m, LH = H + 2 * m, c = Math.max(LW / r, LH), fx = p.x / 100, fy = p.y / 100;
+  var x0 = fx + (m - fx * LW) / (k * r * c), x1 = fx + (m + W - fx * LW) / (k * r * c);
+  var y0 = fy + (m - fy * LH) / (k * c), y1 = fy + (m + H - fy * LH) / (k * c);
+  x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(1, x1); y1 = Math.min(1, y1);
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+}
+// How big a part of the player is (CSS pixels) - as it is when the editor is
+// closed - or null when it is not on screen now.
+function areaBox(k) {
+  var W = window.innerWidth, H = window.innerHeight, compact = S.mode === 'compact', ed = editing() && W >= (compact ? 780 : 900) ? EDIT_W : 0, el;
+  if (k === 'app') return [compact ? W - ed : W, H];
+  if (k === 'mini') return compact ? [W - ed, H] : compactSize();
+  if (k === 'top') return ui.strip && ui.deck ? [compact ? W - ed : W, ui.strip.offsetHeight + ui.deck.offsetHeight] : null;
+  el = k === 'nav' ? ui.nav : k === 'list' ? ui.browser : k === 'lyr' ? (ui.lyBody && ui.lyBody.parentNode) : k === 'queue' ? ui.list : null;
+  if (!el || !el.clientWidth || !el.clientHeight) return null;
+  return [el.clientWidth + (k === 'list' && !compact ? ed : 0), el.clientHeight];
+}
+// width / height of a picture that came without it (saved before this was kept)
+function frameRatio(p, rec) {
+  var v, im;
+  if (!rec || !rec.url || USER.measuring[p.key]) return;
+  USER.measuring[p.key] = true;
+  function got(w, hh) {
+    if (w && hh) { p.ratio = limit(w / hh, 0.05, 20, 0); editFrame(); }
+  }
+  if (p.kind === 'video') {
+    v = document.createElement('video');
+    v.muted = true;
+    v.preload = 'metadata';
+    v.onloadedmetadata = function () { got(v.videoWidth, v.videoHeight); try { v.removeAttribute('src'); v.load(); } catch (e) {} };
+    v.src = rec.url;
+  } else {
+    im = new Image();
+    im.onload = function () { got(im.naturalWidth, im.naturalHeight); };
+    im.src = rec.url;
+  }
+}
+// a point in the framer -> the point the picture is placed by
+var FRAMER = { drag: false, raf: 0, ev: null };
+function frameAt(e) {
+  var p = edPhoto(), fr = ui.edFrame, rc, img;
+  if (!p) return;
+  rc = fr.getBoundingClientRect();
+  img = frameImage(p, fr.clientWidth, fr.clientHeight);
+  p.x = Math.round(limit((e.clientX - rc.left - fr.clientLeft - img.x) / img.w * 100, 0, 100, 50));
+  p.y = Math.round(limit((e.clientY - rc.top - fr.clientTop - img.y) / img.h * 100, 0, 100, 50));
+  editKnobs();
+}
+function frameMove(e) {
+  FRAMER.ev = { clientX: e.clientX, clientY: e.clientY };
+  if (FRAMER.raf) return;
+  FRAMER.raf = requestAnimationFrame(function () {
+    FRAMER.raf = 0;
+    if (FRAMER.ev) frameAt(FRAMER.ev);
+  });
+}
+function frameZoom(by) {
+  var p = edPhoto();
+  if (!p) return;
+  p.size = limit(p.size + by, 40, 300, 100);
+  editKnobs();
+}
+function bindFramer(fr) {
+  fr.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    if (!edPhoto()) { ACT.editphoto(); return; }          // nothing here yet: choose a file
+    e.preventDefault();
+    FRAMER.drag = true;
+    try { fr.setPointerCapture(e.pointerId); } catch (x) {}
+    try { fr.focus({ preventScroll: true }); } catch (x) {}
+    frameMove(e);
+  });
+  fr.addEventListener('pointermove', function (e) { if (FRAMER.drag) frameMove(e); });
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(function (ev) {
+    fr.addEventListener(ev, function () { FRAMER.drag = false; });
+  });
+  fr.addEventListener('wheel', function (e) {
+    if (!edPhoto() || !e.deltaY) return;
+    e.preventDefault();
+    frameZoom(e.deltaY < 0 ? 5 : -5);
+  }, { passive: false });
+  // the keyboard: arrows move the point (with Shift, in bigger steps), + and - zoom
+  fr.addEventListener('keydown', function (e) {
+    var p = edPhoto(), step = e.shiftKey ? 5 : 1;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (!p) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); ACT.editphoto(); } return; }
+    if (e.key === 'ArrowLeft') p.x = limit(p.x - step, 0, 100, 50);
+    else if (e.key === 'ArrowRight') p.x = limit(p.x + step, 0, 100, 50);
+    else if (e.key === 'ArrowUp') p.y = limit(p.y - step, 0, 100, 50);
+    else if (e.key === 'ArrowDown') p.y = limit(p.y + step, 0, 100, 50);
+    else if (e.key === '+' || e.key === '=') { e.preventDefault(); e.stopPropagation(); frameZoom(5); return; }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); e.stopPropagation(); frameZoom(-5); return; }
+    else return;
+    e.preventDefault();
+    e.stopPropagation();                                   // (not for Apple's page either)
+    editKnobs();
+  });
 }
 // the lettering: what the two lists offer and show, and the font file's name
 function editFonts() {
@@ -1034,30 +1385,35 @@ function onEditInput(e) {
     retheme();
     return;
   }
-  if ((k = t.getAttribute('data-p')) && d.photo) {          // one of the photo's sliders
+  if ((k = t.getAttribute('data-p')) && (pair = edPhoto())) {     // one of the picture's sliders
     for (j = 0; j < PHOTO_KNOBS.length; j++)
-      if (PHOTO_KNOBS[j][0] === k) d.photo[k] = limit(t.value, PHOTO_KNOBS[j][2], PHOTO_KNOBS[j][3], PHOTO_KNOBS[j][6]);
+      if (PHOTO_KNOBS[j][0] === k) pair[k] = limit(t.value, PHOTO_KNOBS[j][2], PHOTO_KNOBS[j][3], PHOTO_KNOBS[j][6]);
     editVals();
+    editFrame();
     applyTheme();
   }
 }
-// a photo that was picked in the editor but never saved goes again
-function editDropPhoto() {
-  var d = USER.draft, rec = d && d.photo ? USER.photos[d.photo.key] : null;
+// a picture that was picked in the editor (for this part) but never saved goes again
+function editDropPhoto(area) {
+  var p = areaPhoto(USER.draft, area), rec = p ? USER.photos[p.key] : null;
   if (!rec || rec.saved) return;
   if (rec.url) { try { URL.revokeObjectURL(rec.url); } catch (e) {} }
-  delete USER.photos[d.photo.key];
+  delete USER.photos[p.key];
 }
 function editPhotoPicked(file) {
+  var area = USER.edArea;                                  // (the part it was chosen for, whatever is picked meanwhile)
   editSay('READING THE FILE...');
   return readBackground(file, false).then(function (r) {
-    var d = USER.draft, key = newId('p-'), was;
+    var d = USER.draft, key = newId('p-'), was, p;
     if (!d) return;
-    was = d.photo || {};
-    editDropPhoto();
+    was = areaPhoto(d, area) || {};
+    editDropPhoto(area);
     USER.photos[key] = { url: URL.createObjectURL(r.blob), blob: r.blob, saved: false };
-    d.photo = cleanPhoto({ kind: r.kind, fit: was.fit, size: was.size, x: was.x, y: was.y, tint: was.tint, blur: was.blur, glass: was.glass }, key);   // a new picture keeps the settings of the one before
-    d.photo.thumb = r.thumb;
+    // a new picture keeps the settings of the one before
+    p = cleanPhoto({ kind: r.kind, fit: was.fit, size: was.size, x: was.x, y: was.y, tint: was.tint, blur: was.blur, glass: was.glass,
+      bright: was.bright, sat: was.sat, flip: was.flip, ratio: r.ratio }, key, area);
+    p.thumb = r.thumb;
+    setAreaPhoto(d, area, p);
     editSay('');
     editFill();
     applyTheme();
@@ -1097,21 +1453,26 @@ function editNoFont() {
   applyTheme();
 }
 function editNoPhoto() {
-  var d = USER.draft;
-  if (!d || !d.photo) return;
-  editDropPhoto();
-  delete d.photo;
+  var d = USER.draft, area = USER.edArea;
+  if (!d || !areaPhoto(d, area)) return;
+  editDropPhoto(area);
+  setAreaPhoto(d, area, null);
   editFill();
   applyTheme();
 }
 function editSave() {
-  var d = USER.draft, rec, put = Promise.resolve(), trouble = '';
+  var d = USER.draft, put = Promise.resolve(), trouble = '';
   if (!d) return put;
   d.name = cleanName(d.name);
-  rec = d.photo ? USER.photos[d.photo.key] : null;
-  if (rec && !rec.saved && rec.blob)
-    put = photoPut(d.photo.key, rec.blob).then(function () { rec.saved = true; },
-      function (e) { trouble = 'ITS PICTURE WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+  // the pictures picked since the editor was opened go into the storage
+  themePhotos(d).forEach(function (x) {
+    var key = x[1].key, rec = USER.photos[key];
+    if (!rec || rec.saved || !rec.blob) return;
+    put = put.then(function () {
+      return photoPut(key, rec.blob).then(function () { rec.saved = true; },
+        function (e) { trouble = 'ITS PICTURES WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+    });
+  });
   put = put.then(function () {
     var fr = d.font && d.font.own ? USER.fonts[d.font.own.key] : null;
     if (!fr || fr.saved || !fr.blob) return null;
@@ -1119,12 +1480,14 @@ function editSave() {
       function (e) { trouble = 'ITS FONT WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
   });
   return put.then(function () {
-    var at = -1, i, old = USER.draftPhotoWas, oldFont = USER.draftFontWas;
+    var at = -1, i, used = {}, oldFont = USER.draftFontWas;
     if (USER.draft !== d) return;
     for (i = 0; i < USER.list.length; i++) if (USER.list[i].id === d.id) at = i;
     if (at >= 0) USER.list[at] = d; else USER.list.push(d);
     if (!saveUserThemes()) trouble = 'IT COULD NOT BE KEPT: THE STORAGE IS FULL';
-    if (old && (!d.photo || d.photo.key !== old)) dropPhoto(old);     // the photo it had before is no longer used
+    // the pictures it had before and no longer uses
+    themePhotos(d).forEach(function (x) { used[x[1].key] = true; });
+    USER.draftKeysWas.forEach(function (key) { if (!used[key]) dropPhoto(key); });
     if (oldFont && (!d.font || !d.font.own || d.font.own.key !== oldFont)) dropFont(oldFont);
     USER.draft = null;
     editHide();
@@ -1136,7 +1499,7 @@ function editSave() {
 }
 function editCancel() {
   if (!USER.draft) return;
-  editDropPhoto();
+  AREAS.forEach(function (a) { editDropPhoto(a.k); });
   editDropFont();
   USER.draft = null;
   editHide();
@@ -1148,6 +1511,7 @@ function relayout() {
   placeControls();
   if (deckShown()) { setMarquee(S.marquee, true); kickViz(); vzKick(); }
   if (S.mode === 'full' && B.vlist) B.vlist.update(false);
+  if (USER.draft) editFrame();                            // (what shows of a picture depends on its part's size)
 }
 
 // ---- the list in the themes panel ----
@@ -1156,10 +1520,12 @@ function swatchFor(t) {
   var prev = h('div', { class: 'mp-swatch-prev' });
   var dot = h('div', { class: 'mp-swatch-dot' }), lcd = h('div', { class: 'mp-swatch-lcd' });
   var body = 'linear-gradient(180deg,' + t.shellA + ',' + t.shellB + ')', a;
-  if ((t.user || t.live) && t.photo && t.photo.thumb) {
-    a = (t.photo.tint / 100).toFixed(2);
+  // the picture behind the whole player - or, when only parts have one, the first of those
+  var ph = (t.user || t.live) ? themePhotos(t).filter(function (x) { return x[1].thumb; })[0] : null;
+  if (ph) {
+    a = (ph[1].tint / 100).toFixed(2);
     body = 'linear-gradient(180deg,rgba(' + hexToRgb(t.shellA).join(',') + ',' + a + '),rgba(' + hexToRgb(t.shellB).join(',') + ',' + a + ')),' +
-      'url("' + t.photo.thumb + '") center/cover';
+      'url("' + ph[1].thumb + '") center/cover';
   }
   prev.style.background = body;
   dot.style.background = t.lit;
@@ -1929,7 +2295,7 @@ function rcSysClosed(why) {
 // what the audio element itself says went wrong (the engine's own words)
 document.addEventListener('error', function (e) {
   var el = e.target, err = null;
-  try { err = el && (el.tagName === 'AUDIO' || el.tagName === 'VIDEO') && !(el.classList && el.classList.contains('mp-bgv')) && el.error; } catch (x) {}
+  try { err = el && (el.tagName === 'AUDIO' || el.tagName === 'VIDEO') && !(el.classList && (el.classList.contains('mp-bgv') || el.classList.contains('mp-ar-pic'))) && el.error; } catch (x) {}
   if (err) dlog('media error ' + err.code + ': ' + String(err.message || '').slice(0, 220));
 }, true);
 
@@ -5770,6 +6136,7 @@ var ACT = {
   editcancel: function () { editCancel(); },
   editphoto: function () { if (ui.edFile) { ui.edFile.value = ''; ui.edFile.click(); } },
   editnophoto: function () { editNoPhoto(); },
+  editflip: function () { var p = edPhoto(); if (!p) return; p.flip = !p.flip; editFill(); applyTheme(); },
   editfont: function () { if (ui.edFontFile) { ui.edFontFile.value = ''; ui.edFontFile.click(); } },
   editnofont: function () { editNoFont(); },
   meter: function () { meterNext(); },
@@ -5886,7 +6253,9 @@ function requestCompactSize() {
   var size = compactSize();
   if (FLOAT.win) { floatFit(size[1]); return; }
   if (FLOAT.opening) return;
-  send('compact|1|' + size[0] + '|' + size[1]);
+  // while a theme is being edited, the window is wider by the editor, which
+  // sits beside the compact player instead of over it (player.css)
+  send('compact|1|' + (size[0] + (editing() ? EDIT_W : 0)) + '|' + size[1]);
 }
 function compactSize() {
   var base = ui.strip.offsetHeight + ui.deck.offsetHeight;
@@ -5927,6 +6296,7 @@ function syncPanels() {
     x[0].setAttribute('data-on', x[1] ? '1' : '0');
     x[0].setAttribute('aria-pressed', x[1] ? 'true' : 'false');
   });
+  bgvSync();                           // (a video in a panel that was switched off stops)
 }
 
 function setOnTop(on) {
@@ -6107,7 +6477,7 @@ function buildApp() {
   var foot = h('div', { class: 'mpc-pl-foot' }, ui.total,
     textKey('full', 'OPEN LIBRARY', 'ライブラリ', 'Open the full player to play something else', null, 'only-compact'));
   var pl = h('div', { class: 'mpp mpc-pl' },
-    ui.plHead, ui.list,
+    arLayer('queue'), ui.plHead, ui.list,
     h('div', { class: 'mpc-pl-kanji', lang: 'ja', 'aria-hidden': 'true', text: '音楽' }),
     foot);
   pl.addEventListener('click', onActClick);
@@ -6123,9 +6493,19 @@ function buildApp() {
   root.appendChild(ui.nav);
   root.appendChild(ui.browser);
   root.appendChild(ui.panels);
+  // pictures for parts of the player (applyAreas): the top and the library
+  // are laid over their places in the grid; the list's is inside it
+  root.appendChild(arLayer('top'));
+  root.appendChild(arLayer('nav'));
+  ui.browser.insertBefore(arLayer('list'), ui.browser.firstChild);
   ui.app = root;
   syncPanels();
   return root;
+}
+// the layer that holds a part's picture (made once; applyAreas fills it)
+function arLayer(k) {
+  if (!ui.ar) ui.ar = {};
+  return (ui.ar[k] = h('div', { class: 'mp-ar mp-ar-' + k, 'data-on': '0', 'aria-hidden': 'true' }, h('div', { class: 'mp-ar-pic' })));
 }
 
 // A small key with a lamp, for things that are on or off.
@@ -6198,7 +6578,7 @@ function buildLyricsPanel() {
     h('span', { text: 'LYRICS' }), jp('歌詞'), h('span', { class: 'mp-grip' }), ui.lyRo, ui.lyTr,
     keyBtn('lyr', I.close, 'Hide the lyrics (L)', 'mpc-ibtn'));
   ui.lyPanel = h('section', { class: 'mpp mpp-lyr', 'aria-label': 'Lyrics', 'data-synced': '0' }, head,
-    h('div', { class: 'mpp-screen mpl-screen' }, ui.lyBody,
+    h('div', { class: 'mpp-screen mpl-screen' }, arLayer('lyr'), ui.lyBody,
       h('div', { class: 'mpl-kanji', lang: 'ja', 'aria-hidden': 'true', text: '歌詞' })));     // "lyrics"
   head.addEventListener('click', onActClick);
   ui.lyBody.addEventListener('click', onLyricsClick);
@@ -6416,21 +6796,52 @@ function buildEditor() {
   });
   body.appendChild(ui.edFontFile);
 
-  body.appendChild(sub('BEHIND THE PLAYER', '背景'));
-  ui.edThumb = h('div', { class: 'mpe-thumb', 'data-has': '0' });
-  ui.edNoPhoto = textKey('editnophoto', 'REMOVE', '削除', 'Take the picture out of this theme');
-  body.appendChild(h('div', { class: 'mpe-photo' }, ui.edThumb,
-    h('div', { class: 'mpe-photo-keys' },
-      textKey('editphoto', 'CHOOSE FILE', '選択', 'Put a photo, a moving GIF or a short video from this computer behind the player', I.plus), ui.edNoPhoto)));
-  body.appendChild(h('div', { class: 'mp-hint mpe-hint', text: 'A photo, a moving GIF, or a short video (MP4 or WebM, played without its sound).' }));
+  // ---- pictures: behind the whole player, and for parts of it ----
+  body.appendChild(sub('PICTURES', '画像'));
+  body.appendChild(h('div', { class: 'mp-hint mpe-hint', text: 'Pick a part of the player, then choose a photo, a moving GIF or a short video for it. Every part can have one of its own.' }));
+  ui.edWhere = h('div', { class: 'mpe-where', role: 'group', 'aria-label': 'Behind the whole player, or the compact one' });
+  ['app', 'mini'].forEach(function (k) {
+    var a = areaInfo(k);
+    ui.edWhere.appendChild(h('button', { class: 'mp-key mpe-area', type: 'button', 'data-area': k, 'aria-pressed': 'false', title: a.say },
+      h('i', { class: 'mp-led' }), h('span', { text: a.en }), jp(a.jp)));
+  });
+  // a little map of the full player: each part a key (the visualizer draws
+  // over all of its panel, so it is there only to make the map read right)
+  ui.edMap = h('div', { class: 'mpe-map', role: 'group', 'aria-label': 'Parts of the player' });
+  ['top', 'nav', 'list', 'viz', 'lyr', 'queue'].forEach(function (k) {
+    var a = k === 'viz' ? null : areaInfo(k), el;
+    if (!a) el = h('div', { class: 'mpe-reg', 'data-none': '1', title: 'The visualizer draws over all of its panel: it has no picture' }, h('span', { text: 'VIS' }));
+    else el = h('button', { class: 'mpe-reg', type: 'button', 'data-area': k, 'data-display': a.tint === 'lcd' ? '1' : null, 'aria-pressed': 'false', title: a.say },
+      h('i', { class: 'mp-led' }), h('span', { text: a.en }));
+    el.style.gridArea = k;
+    ui.edMap.appendChild(el);
+  });
+  body.appendChild(ui.edWhere);
+  body.appendChild(ui.edMap);
+  ui.edAreaSay = h('div', { class: 'mp-hint mpe-hint mpe-area-say' });
+  body.appendChild(ui.edAreaSay);
+  ui.edAim = h('i', { class: 'mpe-aim', hidden: true });
+  ui.edView = h('i', { class: 'mpe-view', hidden: true });
+  ui.edFrame = h('div', { class: 'mpe-frame', tabindex: '0', 'data-has': '0', role: 'group',
+    'aria-label': 'The picture for this part. Drag on it (or use the arrow keys) to choose which part of it shows; scroll on it (or press + and -) to zoom' },
+    ui.edView, ui.edAim);
+  bindFramer(ui.edFrame);
+  body.appendChild(ui.edFrame);
+  ui.edNoPhoto = textKey('editnophoto', 'REMOVE', '削除', 'Take this part\'s picture out of the theme');
+  body.appendChild(h('div', { class: 'mpe-photo-keys mpe-photo-row' },
+    textKey('editphoto', 'CHOOSE FILE', '選択', 'A photo, a moving GIF or a short video from this computer, for this part of the player', I.plus), ui.edNoPhoto));
+  body.appendChild(h('div', { class: 'mp-hint mpe-hint', text: 'A photo, a moving GIF, or a short video (MP4 or WebM, played without its sound). ' +
+    'Drag on the picture to choose what shows (the frame marks it), scroll on it to zoom.' }));
   ui.edOpts = h('div', { class: 'mpe-opts', hidden: true });
-  var fits = h('div', { class: 'mpe-fits', role: 'group', 'aria-label': 'How the photo fills the player' });
+  var fits = h('div', { class: 'mpe-fits', role: 'group', 'aria-label': 'How the picture fills its part' });
   FITS.forEach(function (f) {
     fits.appendChild(h('button', { class: 'mp-key mpe-fit', type: 'button', 'data-fit': f[0], 'aria-pressed': 'false', text: f[1] }));
   });
+  ui.edFlip = h('button', { class: 'mp-key mpe-fit mpe-flip', type: 'button', 'data-act': 'editflip', 'aria-pressed': 'false', title: 'Mirror the picture, left to right', text: 'MIRROR' });
+  fits.appendChild(ui.edFlip);
   ui.edOpts.appendChild(fits);
   PHOTO_KNOBS.forEach(function (k) {
-    ui.edOpts.appendChild(h('label', { class: 'mpe-row' }, h('span', { class: 'mpe-label', text: k[1] }),
+    ui.edOpts.appendChild(h('label', { class: 'mpe-row', 'data-row': k[0] }, h('span', { class: 'mpe-label', text: k[1] }),
       h('input', { class: 'mpe-range', type: 'range', min: String(k[2]), max: String(k[3]), step: String(k[4]), 'data-p': k[0] }),
       h('span', { class: 'mpe-val', 'data-v': k[0] })));
   });
@@ -6455,9 +6866,15 @@ function buildEditor() {
     if (k && USER.draft) { e.target.value = USER.draft[k]; e.target.removeAttribute('data-bad'); }
   });
   ed.addEventListener('click', function (e) {
-    var f = e.target.closest && e.target.closest('[data-fit]');
-    if (f && USER.draft && USER.draft.photo) {
-      USER.draft.photo.fit = f.getAttribute('data-fit');
+    var f = e.target.closest && e.target.closest('[data-fit]'), ar = e.target.closest && e.target.closest('[data-area]'), p = edPhoto();
+    if (ar && USER.draft) {                                // another part of the player
+      USER.edArea = ar.getAttribute('data-area');
+      editSay('');
+      editFill();
+      return;
+    }
+    if (f && p) {
+      p.fit = f.getAttribute('data-fit');
       editFill();
       applyTheme();
       return;
@@ -6666,6 +7083,8 @@ function onKey(e) {
     if (t === ui.search || (ui.menu && ui.menu.contains(t)) || (ui.editor && ui.editor.contains(t))) e.stopPropagation();
     return;
   }
+  // the editor's framer has keys of its own (arrows move the picture, + and - zoom)
+  if (t && t === ui.edFrame) return;
   // Alt + Up / Down on a playlist in the library panel: move it up or down
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown') && t && ui.navPls && t.parentNode === ui.navPls) {
     e.preventDefault(); e.stopImmediatePropagation();
@@ -6818,5 +7237,6 @@ window.__mp = {
   user: USER, userThemes: { edit: editOpen, save: editSave, cancel: editCancel, photo: editPhotoPicked, noPhoto: editNoPhoto,
     font: editFontPicked, noFont: editNoFont, file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor },
   cover: COVER, coverPalette: coverPalette, nowPlaying: NP, hostMessage: onHostMessage,
-  recover: RC, playbackError: onPlaybackError, recoverNote: rcNote, recoverWatch: rcWatch, recoverStreak: rcStreak, recoverAsked: rcAsked
+  recover: RC, playbackError: onPlaybackError, recoverNote: rcNote, recoverWatch: rcWatch, recoverStreak: rcStreak, recoverAsked: rcAsked,
+  areas: AREAS, areaPhoto: areaPhoto, areaLayers: function () { return ui.ar; }, viewOf: viewOf, areaBox: areaBox, framer: { at: frameAt, zoom: frameZoom }
 };
