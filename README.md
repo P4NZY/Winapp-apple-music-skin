@@ -8,14 +8,15 @@ Looking for Spotify and SoundCloud? The same player for those is [Stream Player]
 
 ## Features
 
-- **Deck:** time display, level meter, transport keys and volume across the top.
+- **Deck:** time display, level meter, transport keys and volume across the top. Click the small meter to change what it shows: rows of lamps, classic green-to-red bars, or an oscilloscope.
 - **Library:** your playlists, songs, albums and artists, plus search across the whole Apple Music catalog. Songs you add to your library or to a playlist sync to your other devices.
 - **Visualizer panel:** 15 WebGL effects (waves, stars, tunnel, plasma, sakura, fireworks and more) that move with the music.
 - **Lyrics panel** that follows the song.
 - **Queue panel.** With shuffle on, the song you click plays first and the rest is shuffled after it.
 - **Your own playlist order:** drag playlists, or use Alt+↑ / Alt+↓. RESET goes back to Apple's order.
-- **18 colour themes**, including Hatsune Miku, Kasane Teto and Ado.
-- **Themes of your own:** pick every colour and put a photo behind the player (fill, fit, stretch or tile it; size, position, tint, blur, and how see-through the displays are). EXPORT saves a theme as one `.mpskin` file, photo included, and IMPORT opens it on your other computer, Windows or Mac.
+- **18 colour themes**, including Hatsune Miku, Kasane Teto and Ado, and an **Album cover** theme that takes its colours from the cover of the song playing and glides to the next song's, with the cover itself, blurred, behind the player.
+- **Themes of your own:** pick every colour, the lettering (a few fonts every computer has, or a font file of your own), and what goes behind the player: a photo, a moving GIF or a short video (fill, fit, stretch or tile it; size, position, tint, blur, and how see-through the displays are). EXPORT saves a theme as one `.mpskin` file, picture and font included, and IMPORT opens it on your other computer, Windows or Mac.
+- **While you play something else** (Windows): a small "now playing" card slides into a corner of the screen when the song changes, over whatever is in front, including a game set to windowed fullscreen. And, if you switch it on, the song shows on your Discord profile (see [Discord](#discord)).
 - **Compact player** (Ctrl+M) that can stay above everything: on Windows including fullscreen browsers and games in windowed fullscreen, on a Mac in a small window of its own that floats above every app.
 
 ## Run it on Windows
@@ -37,6 +38,15 @@ The same player for a Mac, in `Music Player for Mac/`. Needs Google Chrome, Micr
 
 The installer makes a **Music Player** app in your Applications folder: it opens the player in a browser profile of its own (with Brave it switches Widevine on, which Apple's full songs need) and stays open while the player does, so the Dock shows the dot under it. The visualizer follows the music by itself, and the compact player floats above every app. `Music Player for Mac/READ ME FIRST.txt` has the details.
 
+## Discord
+
+Off until you switch it on (THEMES, then "While you play"). Discord shows a song under an "application" that belongs to you, so make one once:
+
+1. Open [discord.com/developers/applications](https://discord.com/developers/applications) and press **New Application**. The name you give it is what friends see: "Listening to" and that name.
+2. Copy its **Application ID** and paste it into the box in the player.
+
+While it is on, the title, artist, album and cover address of what you play go to the Discord app on your PC, and from there to Discord. Pause, or close the player, and it goes away again. The Discord desktop app has to be running; this is Windows only.
+
 ## Keys
 
 | Key | What it does |
@@ -53,7 +63,7 @@ The installer makes a **Music Player** app in your Applications folder: it opens
 ## Changing it
 
 - **The look and behaviour** are in `app\ui\player.css` and `app\ui\player.js`. Edit them and restart the app; nothing needs rebuilding.
-- **The app itself** is `src\MusicPlayer.cs` (the window and the WebView2 host) and `src\AudioTap.cs` (listens to the app's own sound so the visualizer and meter can follow the music). Rebuild with:
+- **The app itself** is `src\MusicPlayer.cs` (the window and the WebView2 host), `src\AudioTap.cs` (listens to the app's own sound so the visualizer and meter can follow the music) and `src\NowPlaying.cs` (the "now playing" card, and Discord). Rebuild with:
 
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\build.ps1
@@ -73,7 +83,9 @@ The installer makes a **Music Player** app in your Applications folder: it opens
 
 `MusicPlayer.exe` hosts music.apple.com in WebView2 and injects the skin. Apple's page keeps running underneath: its MusicKit loads your library and plays the music, while the skin draws the interface and tells it what to do. Songs are copy-protected and decoded outside the page, so the page can't hear them; the app captures its own sound output instead and passes it to the visualizer and the level meter.
 
-A theme of your own is kept in the page's storage (the photos in IndexedDB). A `.mpskin` file is plain JSON: the name, the six colours, and the photo with its settings, the way a Winamp `.wsz` carries its pictures and colour files in one piece. Whatever is read from such a file is checked first: colours must be `#rrggbb`, numbers are kept in range, and the photo must decode as a picture.
+A theme of your own is kept in the page's storage (pictures, videos and fonts in IndexedDB). A `.mpskin` file is plain JSON: the name, the six colours, the lettering, and the picture with its settings, the way a Winamp `.wsz` carries its pictures and colour files in one piece. Whatever is read from such a file is checked first: colours must be `#rrggbb`, numbers are kept in range, a picture or video must decode, and a font file must load as a font. A theme with only colours and a photo is written as version 1 and still opens in an older copy of the player; a moving picture, a video or lettering makes it version 2.
+
+The Album cover theme reads the cover's pixels (Apple's picture server allows that) and works six colours out of them. The same small copy of the cover goes to the Windows app with the song's details, which is what the "now playing" card is drawn from. For Discord the app talks to the Discord app on the same PC over its local pipe (`discord-ipc-0`), nothing else.
 
 On a Mac, a browser extension injects the same skin into music.apple.com, in an app window with a browser profile of its own. To let the visualizer hear the music, the extension captures the tab's sound (`chrome.tabCapture`). The browser is started with `--allowlisted-extension-id`, so no toolbar click is needed. The floating compact player is a Document Picture-in-Picture window.
 

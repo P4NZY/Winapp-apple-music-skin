@@ -150,8 +150,10 @@ $cscArgs = @(
     "/reference:$(Join-Path $app 'Microsoft.Web.WebView2.WinForms.dll')",
     '/reference:System.Windows.Forms.dll',
     '/reference:System.Drawing.dll',
+    '/reference:System.Core.dll',            # named pipes (Discord)
     $src,
-    (Join-Path $here 'src\AudioTap.cs')      # sound capture for the visualizer
+    (Join-Path $here 'src\AudioTap.cs'),     # sound capture for the visualizer
+    (Join-Path $here 'src\NowPlaying.cs')    # the "now playing" card, and Discord
 )
 & $csc @cscArgs
 if ($LASTEXITCODE -ne 0) { throw "Compile failed (csc exit code $LASTEXITCODE)." }

@@ -37,6 +37,7 @@ namespace MusicPlayerApp
         public int Delay = 6000;    // --delay    : ms to wait after the page loads
         public int Settle = 2500;   // --settle   : ms to wait after the script ran
         public int Width, Height;   // --size     : starting client size
+        public string DiscordPipe;  // --discord-pipe : (test runs) a stand-in for Discord's pipe; without it a test run never talks to Discord
 
         // Any of the test switches makes this a throw-away run: muted, no saved
         // window position, and it does not count as "the" running instance.
@@ -56,6 +57,7 @@ namespace MusicPlayerApp
                     case "--capture":  if (next != null) { o.Capture = next; i++; } break;
                     case "--script":   if (next != null) { o.Script = next; i++; } break;
                     case "--result":   if (next != null) { o.Result = next; i++; } break;
+                    case "--discord-pipe": if (next != null) { o.DiscordPipe = next; i++; } break;
                     case "--size":     // WxH client size in pixels, for test captures
                         if (next != null)
                         {
@@ -265,7 +267,7 @@ namespace MusicPlayerApp
                 core.NewWindowRequested += OnNewWindow;
                 core.NavigationStarting += OnNavigationStarting;
                 core.NavigationCompleted += OnNavigationCompleted;
-                core.NavigationCompleted += delegate { seenSent = -1; };   // a new page: tell it again
+                core.NavigationCompleted += delegate { seenSent = -1; SendCaps(); };   // a new page: tell it again
                 core.ProcessFailed += OnProcessFailed;
                 core.Navigate(opts.Url);
                 StartSeenWatch();
@@ -473,13 +475,34 @@ namespace MusicPlayerApp
 
             string msg;
             try { msg = e.TryGetWebMessageAsString(); } catch { return; }
-            if (string.IsNullOrEmpty(msg) || msg.Length > 600) return;
-            if (opts.IsTestRun) testLog.AppendLine(msg);
+            if (string.IsNullOrEmpty(msg)) return;
+            // "np|" carries the song, with a small picture of its cover: it may be long
+            bool song = msg.StartsWith("np|", StringComparison.Ordinal);
+            if (msg.Length > (song ? 48000 : 600)) return;
+            if (opts.IsTestRun) testLog.AppendLine(msg.Length > 400 ? msg.Substring(0, 400).Replace('\u001f', '~') + "...[" + msg.Length + "]" : msg);
+            if (song) { OnNowPlaying(msg.Substring(3)); return; }
 
             string[] p = msg.Split('|');
             int a, b;
             switch (p[0])
             {
+                case "hello":   // hello|<n>  the page has started: say what this app can do
+                    SendCaps();
+                    break;
+
+                case "popup":   // popup|<0/1>|<corner tl/tr/bl/br>     popup|test = show a card now
+                    if (p.Length >= 2 && p[1] == "test") ShowCard(true);
+                    else if (p.Length >= 3)
+                    {
+                        popupOn = p[1] == "1";
+                        if (p[2] == "tl" || p[2] == "tr" || p[2] == "bl" || p[2] == "br") popupPos = p[2];
+                    }
+                    break;
+
+                case "discord": // discord|<0/1>|<application id>
+                    if (discord != null) discord.Configure(p.Length >= 3 && p[1] == "1", p.Length >= 3 ? p[2] : "");
+                    break;
+
                 case "theme":   // theme|<page dark 0/1>|<caption RRGGBB>|<text RRGGBB>|<caption dark 0/1>
                     if (p.Length >= 4 && TryHex(p[2], out a) && TryHex(p[3], out b))
                     {
@@ -528,6 +551,128 @@ namespace MusicPlayerApp
                     Text = t.Length == 0 ? "Music Player" : t;
                     break;
             }
+        }
+
+        // ------------------------------------------- the song, while elsewhere --
+        // (the card and Discord themselves are in NowPlaying.cs)
+        NowPlaying nowPlaying;
+        bool popupOn = true;
+        string popupPos = "tr";
+        string cardKey = "";                    // the song a card was last shown for
+        ToastWindow toast;
+        int cardShots;                          // (test runs) pictures of the card saved so far
+        System.Windows.Forms.Timer cardSoon;
+        DiscordPresence discord;
+
+        void SendCaps()
+        {
+            try
+            {
+                if (web == null || web.CoreWebView2 == null) return;
+                if (discord == null && (!opts.IsTestRun || opts.DiscordPipe != null))
+                {
+                    discord = new DiscordPresence(
+                        SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext(),
+                        delegate(string state) { try { web.CoreWebView2.PostWebMessageAsString("discord|" + state); } catch { } },
+                        opts.DiscordPipe);
+                }
+                web.CoreWebView2.PostWebMessageAsString(discord != null ? "caps|popup,discord" : "caps|popup");
+            }
+            catch { }
+        }
+
+        void OnNowPlaying(string body)
+        {
+            NowPlaying np = NowPlaying.Parse(body);
+            if (np == null) return;
+            bool sameSong = nowPlaying != null && nowPlaying.Key == np.Key;
+            if (np.Art == null && sameSong) np.Art = nowPlaying.Art;      // (the picture comes once per song)
+            nowPlaying = np;
+            if (discord != null) discord.Show(np);
+            if (toast != null && sameSong) toast.Repaint(np);
+
+            // A new song started: a card, a moment later - the cover follows the
+            // song by a beat, and skipping through songs should not flash a
+            // card for each.
+            if (!np.Playing || np.Key.Length == 0 || np.Key == cardKey) return;
+            cardKey = np.Key;
+            if (cardSoon == null)
+            {
+                cardSoon = new System.Windows.Forms.Timer();
+                cardSoon.Interval = 900;
+                cardSoon.Tick += delegate { cardSoon.Stop(); ShowCard(false); };
+            }
+            cardSoon.Stop();
+            cardSoon.Start();
+        }
+
+        // Would a card tell the listener anything? Not while the player itself
+        // is the window they are using, and not while the compact player is
+        // kept on top of everything (it shows the song already).
+        bool CardWanted()
+        {
+            if (opts.IsTestRun) return true;
+            IntPtr fg = GetForegroundWindow();
+            if (fg == Handle) return false;
+            uint pid;
+            GetWindowThreadProcessId(fg, out pid);
+            if (pid == myPid) return false;
+            if (compact && TopMost && Visible && WindowState != FormWindowState.Minimized) return false;
+            return true;
+        }
+
+        void ShowCard(bool asked)
+        {
+            try
+            {
+                NowPlaying np = nowPlaying;
+                if (np == null || np.Title.Length == 0)
+                {
+                    if (!asked) return;
+                    np = new NowPlaying();          // SHOW ONE with nothing playing: a sample
+                    np.Title = "Song title";
+                    np.Artist = "Artist";
+                    np.Album = "Album";
+                    if (nowPlaying != null) np.Colours = nowPlaying.Colours;
+                }
+                if (!asked && (!popupOn || !np.Playing || !CardWanted())) return;
+
+                // on the screen of whatever is in front; inside the taskbar's
+                // edge unless that window covers the whole screen (a game)
+                IntPtr fg = GetForegroundWindow();
+                Screen scr = fg != IntPtr.Zero ? Screen.FromHandle(fg) : Screen.PrimaryScreen;
+                Rectangle area = scr.WorkingArea;
+                RECT r;
+                if (fg != IntPtr.Zero && fg != Handle && GetWindowRect(fg, out r) &&
+                    r.Left <= scr.Bounds.Left && r.Top <= scr.Bounds.Top && r.Right >= scr.Bounds.Right && r.Bottom >= scr.Bounds.Bottom)
+                {
+                    var cls = new StringBuilder(64);
+                    GetClassName(fg, cls, 64);
+                    string c = cls.ToString();
+                    if (c != "Progman" && c != "WorkerW") area = scr.Bounds;
+                }
+
+                if (toast == null)
+                {
+                    Image logo = null;
+                    try
+                    {
+                        string logoPath = Path.Combine(uiDir, "icon.png");
+                        if (File.Exists(logoPath)) logo = Image.FromStream(new MemoryStream(File.ReadAllBytes(logoPath)));
+                    }
+                    catch { }
+                    toast = new ToastWindow(logo);
+                    if (opts.IsTestRun && opts.Result != null)
+                        toast.Settled = delegate
+                        {
+                            toast.SavePicture(opts.Result + ".card" + (++cardShots) + ".png");
+                            testLog.AppendLine("# card: " + toast.Bounds + " opacity=" + toast.Opacity + " topmost=" + toast.TopMost +
+                                               " title=" + (nowPlaying != null ? nowPlaying.Title : "") + " art=" + (nowPlaying != null && nowPlaying.Art != null));
+                        };
+                }
+                toast.ShowCard(np, popupPos, area);
+            }
+            catch (Exception ex) { WriteLog("now-playing card: " + ex.Message); }
         }
 
         // ------------------------------------------------------------ compact mode
@@ -736,6 +881,8 @@ namespace MusicPlayerApp
         {
             try { if (feed != null) feed.Stop(); } catch { }
             try { if (fgHook != IntPtr.Zero) { UnhookWinEvent(fgHook); fgHook = IntPtr.Zero; } } catch { }
+            try { if (cardSoon != null) cardSoon.Stop(); if (toast != null) toast.Close(); } catch { }
+            try { if (discord != null) discord.Dispose(); } catch { }      // (closing the pipe takes the song off the profile)
             if (opts.IsTestRun) return;
             try
             {

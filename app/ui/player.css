@@ -625,6 +625,17 @@ html[data-mp-layout="top"] .mpf-kanji { font-size: 72px; }
 .mp-opt[aria-checked="true"] .mp-switch::after { transform: translateX(20px); }
 .mp-opt[aria-checked="true"] .mp-switch .mp-led { left: 7px; }
 .mp-hint { margin-top: 8px; font-size: 11.5px; color: var(--mp-shell-dim); line-height: 1.7; }
+/* "while you play": only where the app can do it (the Windows app says so) */
+.mp-away-opts { display: none; }
+html[data-mp-caps~="popup"] .mp-away-opts { display: block; }
+.mp-opt-more { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 0 0 9px; font-size: 12.5px; }
+.mp-opt-more[hidden], .mp-dc[hidden], .mp-dc-state[hidden] { display: none; }
+.mp-opt-more .mpe-fit { flex: 1 1 86px; padding: 0 6px; white-space: nowrap; }
+.mp-opt-more .mpc-lib { height: 26px; }
+.mp-opt-label { flex: 1; min-width: 0; }
+.mp-dc .mp-dc-id { flex: 0 0 210px; width: 210px; font-family: var(--mp-f-mono); }
+.mp-dc .mp-hint { margin-top: 6px; }
+.mp-dc .mp-dc-state { margin: 0 0 2px; }
 .mp-kbd {
   padding: 1px 6px;
   border-radius: 4px;
@@ -719,8 +730,29 @@ html[data-mp-layout="top"] .mpf-kanji { font-size: 72px; }
   background: var(--mp-lcd-bg) center / cover no-repeat;
   box-shadow: inset 0 2px 5px rgba(0, 0, 0, .6), 0 1px 0 var(--mp-hi);
 }
+.mpe-thumb { position: relative; }
+/* what kind it is, when it moves */
+.mpe-thumb[data-kind="anim"]::before,
+.mpe-thumb[data-kind="video"]::before {
+  content: "GIF";
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, .7);
+  color: #fff;
+  font: 700 8.5px/1 var(--mp-f-mono);
+  letter-spacing: .12em;
+}
+.mpe-thumb[data-kind="video"]::before { content: "VIDEO"; }
+#mp-editor .mpe-select { flex: 0 0 172px; width: 172px; height: 26px; padding: 0 6px; cursor: pointer; }
+.mpe-select option { color: #111; background: #fff; }
+.mpe-font { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.mpe-font-name { flex: 1; min-width: 0; font-size: 11.5px; line-height: 1.5; color: var(--mp-shell-dim); overflow-wrap: anywhere; }
+.mpe-fit:disabled { opacity: .35; cursor: default; }
 .mpe-thumb[data-has="0"]::after {
-  content: "NO PHOTO";
+  content: "NOTHING YET";
   display: grid;
   place-items: center;
   height: 100%;
@@ -767,6 +799,28 @@ html[data-mp-layout="top"] .mpf-kanji { font-size: 72px; }
   background-repeat: repeat;
   transform: none;
 }
+/* a video is an element of its own (it cannot be a background), laid out by
+   the same values; FIT and STRETCH as for a photo */
+#mp-app > .mp-bgv {
+  position: absolute;
+  left: calc(var(--mp-photo-blur, 0px) * -2.5);
+  top: calc(var(--mp-photo-blur, 0px) * -2.5);
+  width: calc(100% + var(--mp-photo-blur, 0px) * 5);
+  height: calc(100% + var(--mp-photo-blur, 0px) * 5);
+  z-index: -2;
+  pointer-events: none;
+  object-fit: cover;
+  object-position: var(--mp-photo-x, 50%) var(--mp-photo-y, 50%);
+  filter: blur(var(--mp-photo-blur, 0px));
+  transform: scale(var(--mp-photo-k, 1));
+  transform-origin: var(--mp-photo-x, 50%) var(--mp-photo-y, 50%);
+}
+#mp-app[data-photo="contain"] > .mp-bgv { object-fit: contain; }
+#mp-app[data-photo="stretch"] > .mp-bgv { object-fit: fill; }
+/* a moving picture stops while nobody can see the player */
+html[data-mp-seen="0"] #mp-app[data-photo-kind="anim"]::before { display: none; }
+/* the "Album cover" theme: one cover fades into the next */
+#mp-app[data-photo-kind="live"]::before { transition: background-image .9s linear; }
 #mp-app[data-photo]::after {
   content: "";
   position: absolute;
@@ -954,7 +1008,7 @@ html[data-mp-mode="full"] .mpc-deck {
   color: var(--mp-lcd-fg);
   text-shadow: var(--mp-glow);
 }
-.mpc-viz { grid-column: 1 / -1; width: 100%; height: 100%; }
+.mpc-viz { grid-column: 1 / -1; width: 100%; height: 100%; cursor: pointer; }
 
 .mpc-info {
   grid-area: info;

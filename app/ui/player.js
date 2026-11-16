@@ -202,6 +202,12 @@ var S = {
   showLyr: store.get('showLyr', true),           // panel: lyrics
   vizBig: false,                                 // visualizer fills the whole window
   remaining: store.get('remaining', false),      // clock shows time remaining
+  meter: store.get('meter', 'led'),              // the small display under the clock: led | classic | scope
+  // while something else is in front (Windows app; see "Now playing, for the app")
+  popup: store.get('popup', true),               // a small card when the song changes
+  popupPos: store.get('popupPos', 'tr'),         // which corner: tl | tr | bl | br
+  discord: store.get('discord', false),          // show the song on the listener's Discord profile
+  discordId: store.get('discordId', ''),         // the Discord application ID it is shown under
   mode: 'full',         // full | compact | apple
   panelOpen: false,
   music: null,          // the page's MusicKit instance
@@ -223,11 +229,23 @@ var sheet = null;
 
 // Themes of your own (see "Themes of your own" below): the saved ones, their
 // photos once read from storage, and the one being edited.
-var USER = { list: [], photos: {}, dbP: null, draft: null, draftPhotoWas: '', armTimer: 0, msgTimer: 0 };
+var USER = { list: [], photos: {}, fonts: {}, dbP: null, draft: null, draftPhotoWas: '', draftFontWas: '', armTimer: 0, msgTimer: 0 };
+
+// The "Album cover" theme: its colours are worked out from the cover of the
+// song that is playing, and glide from one song's to the next (see "The cover").
+var COVER = {
+  t: { id: 'cover', name: 'Album cover', jp: 'ジャケット', live: true },
+  key: null,            // the artwork it was last worked out from
+  pal: null,            // the six colours from that cover (null: none, the last built-in theme stands in)
+  jpeg: '',             // a small copy of the cover, for the app's "now playing" card
+  big: '',              // address of the copy shown, blurred, behind the player
+  from: null, to: null, t0: 0, raf: 0, tok: 0, n: 0
+};
 
 function themeNow() {
   var i;
   if (USER.draft) return USER.draft;                   // the editor is open: what it shows is the theme
+  if (S.theme === 'cover') return COVER.t;
   for (i = 0; i < THEMES.length; i++) if (THEMES[i].id === S.theme) return THEMES[i];
   for (i = 0; i < USER.list.length; i++) if (USER.list[i].id === S.theme) return USER.list[i];
   return THEMES[0];
@@ -267,13 +285,15 @@ function installCss() {
 // A built-in theme is a rule in the style sheet (themeCss). A theme of your
 // own has none: its colours are set on the element itself, which is also what
 // lets the editor show every change the moment it is made.
-var OWN_VARS = ['--mp-shell-a', '--mp-shell-b', '--mp-shell-text', '--mp-lit', '--mp-lcd-bg', '--mp-lcd-bg-rgb', '--mp-lcd-fg', '--mp-lcd-fg-rgb'];
+// (The last two are the lettering: '' leaves the skin's own fonts in place.)
+var OWN_VARS = ['--mp-shell-a', '--mp-shell-b', '--mp-shell-text', '--mp-lit', '--mp-lcd-bg', '--mp-lcd-bg-rgb', '--mp-lcd-fg', '--mp-lcd-fg-rgb', '--mp-f-mono', '--mp-f-ui'];
 function ownVars(t) {
-  return [t.shellA, t.shellB, t.shellText, t.lit, t.lcdBg, hexToRgb(t.lcdBg).join(','), t.lcdFg, hexToRgb(t.lcdFg).join(',')];
+  return [t.shellA, t.shellB, t.shellText, t.lit, t.lcdBg, hexToRgb(t.lcdBg).join(','), t.lcdFg, hexToRgb(t.lcdFg).join(','),
+    fontStack(t, 'lcd'), fontStack(t, 'ui')];
 }
 
 function applyTheme() {
-  var t = themeNow(), pin = floatOk() ? '1' : '0', own = t.user ? ownVars(t) : null, sig = own ? own.join('|') : '';
+  var t = themeNow(), pin = floatOk() ? '1' : '0', own = (t.user || t.live) ? ownVars(t) : null, sig = own ? own.join('|') : '';
   // the page's <html>, and the floating compact player's (Mac) when it is open
   [document.documentElement, FLOAT.win && FLOAT.win.document.documentElement].forEach(function (root) {
     if (!root) return;
@@ -282,8 +302,9 @@ function applyTheme() {
     if (root.getAttribute('data-mp-host') !== HOST_KIND) root.setAttribute('data-mp-host', HOST_KIND);
     if (root.getAttribute('data-mp-pin') !== pin) root.setAttribute('data-mp-pin', pin);
     if (root.__mpOwn !== sig || (sig && !root.style.getPropertyValue('--mp-shell-a'))) {
-      OWN_VARS.forEach(function (name, i) { if (own) root.style.setProperty(name, own[i]); else root.style.removeProperty(name); });
+      OWN_VARS.forEach(function (name, i) { if (own && own[i]) root.style.setProperty(name, own[i]); else root.style.removeProperty(name); });
       root.__mpOwn = sig;
+      if (root === document.documentElement) setTimeout(fitClock, 0);      // other lettering can be wider
     }
   });
   // the page shows a plate saying where the player went while it floats
@@ -305,10 +326,18 @@ function notifyHost() {
 }
 
 function setTheme(id) {
+  var was = themeNow();
+  if (id === 'cover' && S.theme !== 'cover') {
+    // starts from the colours showing now and glides to the cover's
+    COLOURS.forEach(function (c) { COVER.t[c[0]] = was[c[0]]; });
+  }
   S.theme = id;
   store.set('theme', id);
-  if (!userTheme(id)) store.set('themeBase', id);      // the built-in one to fall back on if a theme of your own is deleted
+  // the built-in one to fall back on: when a theme of your own is deleted, and
+  // for "Album cover" while nothing with a cover is playing
+  if (!userTheme(id) && id !== 'cover') store.set('themeBase', id);
   retheme();
+  if (id === 'cover') coverAim();
   syncPanel();
 }
 
@@ -319,27 +348,31 @@ function retheme() {
   vizColors();
   vzColors();
   kickViz();
+  npSync();
 }
 
 // ============================================================================
 // Themes of your own
-// The same six colours as a built-in theme, a name, and optionally a photo
-// behind the player with how it is laid out (fit, size, place, how much of the
-// body colour lies over it, blur, how see-through the displays are).
+// The same six colours as a built-in theme, a name, and optionally
+//   - lettering: one of a few fonts every computer has, or a font file
+//   - something behind the player - a photo, a moving picture (GIF) or a
+//     video - with how it is laid out (fit, size, place, how much of the body
+//     colour lies over it, blur, how see-through the displays are)
 //
 //   the list      the page's storage, mp.userThemes (small: colours, settings
-//                 and a thumbnail of the photo)
-//   the photos    a little database of their own, IndexedDB "mp-skins" (they
-//                 are too big for the other storage)
-//   on the move   one .mpskin file per theme: plain JSON with the photo inside
-//                 it - the way a Winamp .wsz carries its pictures and colour
-//                 files in one piece. Made on Windows it opens on the Mac
-//                 version, and the other way round.
+//                 and a thumbnail of the picture)
+//   the files     a little database of their own, IndexedDB "mp-skins": the
+//                 pictures, videos and fonts (too big for the other storage)
+//   on the move   one .mpskin file per theme: plain JSON with the picture and
+//                 the font inside it - the way a Winamp .wsz carries its
+//                 pictures and colour files in one piece. Made on Windows it
+//                 opens on the Mac version, and the other way round.
 //
 // Everything read from storage or from a file goes through cleanTheme /
-// cleanPhoto first: colours must be #rrggbb, numbers are kept within range,
-// and a photo must really decode as a picture. Nothing from a file is ever
-// used as markup or as a style rule.
+// cleanPhoto / cleanFont first: colours must be #rrggbb, numbers are kept
+// within range, lettering must be one of the names in FONTS, a picture or a
+// video must really decode, a font file must really load as a font. Nothing
+// from a file is ever used as markup or as a style rule.
 // ============================================================================
 var COLOURS = [
   ['shellA', 'Body, top'], ['shellB', 'Body, bottom'], ['shellText', 'Lettering'],
@@ -358,6 +391,28 @@ var PHOTO_KNOBS = [
 ];
 var SKIN_FORMAT = 'music-player-skin';
 var PHOTO_MAX = 2560;             // longest side kept, in pixels (a large screen's worth)
+// What goes behind the player can also move: a GIF (or animated WebP / PNG)
+// and a video are kept just as they are, up to these sizes.
+var ANIM_MAX = 30 * 1024 * 1024, VIDEO_MAX = 50 * 1024 * 1024;
+var FONT_MAX = 12 * 1024 * 1024;  // a font file inside a theme
+var SKIN_MAX = 100 * 1024 * 1024; // a skin file (what is inside it grows by a third on the way)
+// Lettering a theme can pick. The named ones are fonts that Windows and macOS
+// both have, so a theme looks the same on the other computer; 'own' is the
+// font file kept inside the theme. Japanese falls through to the usual fonts.
+var JP_FALLBACK = ', "Yu Gothic UI", "Meiryo UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", sans-serif';
+var FONTS = [
+  ['', 'Standard', ''],
+  ['courier', 'Typewriter', '"Courier New", Courier'],
+  ['arial', 'Plain', 'Arial, Helvetica'],
+  ['verdana', 'Wide', 'Verdana, Geneva'],
+  ['trebuchet', 'Friendly', '"Trebuchet MS", "Lucida Grande"'],
+  ['georgia', 'Book', 'Georgia, "Times New Roman"'],
+  ['times', 'Newspaper', '"Times New Roman", Times'],
+  ['impact', 'Poster', 'Impact, "Arial Narrow"'],
+  ['comic', 'Comic', '"Comic Sans MS", "Chalkboard SE"']
+];
+// which lettering: [key in the theme, label in the editor]
+var FONT_ROLES = [['lcd', 'Displays'], ['ui', 'Labels and keys']];
 
 function newId(prefix) {
   var s = '', i;
@@ -365,16 +420,43 @@ function newId(prefix) {
   return prefix + s;
 }
 function limit(v, lo, hi, d) { v = +v; return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; }
-function cleanName(s) {
+function cleanName(s, d) {
   s = String(s === undefined || s === null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
-  return s || 'My theme';
+  return s || d || 'My theme';
 }
 function cleanPhoto(p, key) {
-  var out = { key: key, fit: 'cover', thumb: '' }, i, k;
+  // kind: still (a photo) | anim (a moving picture) | video
+  var out = { key: key, kind: p.kind === 'anim' || p.kind === 'video' ? p.kind : 'still', fit: 'cover', thumb: '' }, i, k;
   for (i = 0; i < FITS.length; i++) if (FITS[i][0] === p.fit) out.fit = p.fit;
+  if (out.kind === 'video' && out.fit === 'tile') out.fit = 'cover';      // (a video cannot be tiled)
   for (i = 0; i < PHOTO_KNOBS.length; i++) { k = PHOTO_KNOBS[i]; out[k[0]] = limit(p[k[0]], k[2], k[3], k[6]); }
   if (typeof p.thumb === 'string' && p.thumb.length < 60000 && /^data:image\/(jpeg|webp|png);base64,[A-Za-z0-9+\/=]+$/.test(p.thumb)) out.thumb = p.thumb;
   return out;
+}
+// The lettering of a theme: { lcd, ui, own: { key, name } } - or null for the skin's own.
+function cleanFont(f) {
+  if (!f || typeof f !== 'object') return null;
+  var out = { lcd: '', ui: '' };
+  function known(id) { return id === 'own' || FONTS.some(function (x) { return x[0] === id; }) ? id : ''; }
+  out.lcd = known(f.lcd);
+  out.ui = known(f.ui);
+  if (f.own && typeof f.own === 'object' && /^f-[a-z0-9]{6,16}$/.test(f.own.key)) out.own = { key: f.own.key, name: cleanName(f.own.name, 'Font') };
+  if (!out.own) { if (out.lcd === 'own') out.lcd = ''; if (out.ui === 'own') out.ui = ''; }
+  return out.lcd || out.ui || out.own ? out : null;
+}
+// The font-family a theme wants for its displays ('lcd') or its labels ('ui');
+// '' means the skin's own.
+function fontStack(t, which) {
+  var f = t.font, id = f ? f[which] : '', rec, i;
+  if (!id) return '';
+  if (id === 'own') {
+    if (!f.own) return '';
+    rec = USER.fonts[f.own.key];
+    if (!rec) fontLoad(f.own.key);                       // not read yet: it arrives in a moment
+    return rec && rec.ready ? '"' + rec.family + '"' + JP_FALLBACK : '';
+  }
+  for (i = 1; i < FONTS.length; i++) if (FONTS[i][0] === id) return FONTS[i][2] + JP_FALLBACK;
+  return '';
 }
 // A theme as stored, or as read from a file -> one this app can trust (or null).
 function cleanTheme(raw, keepId) {
@@ -386,6 +468,8 @@ function cleanTheme(raw, keepId) {
     t[k] = raw[k].toLowerCase();
   }
   if (raw.photo && typeof raw.photo === 'object' && /^p-[a-z0-9]{6,16}$/.test(raw.photo.key)) t.photo = cleanPhoto(raw.photo, raw.photo.key);
+  var f = cleanFont(raw.font);
+  if (f) t.font = f;
   return t;
 }
 function userTheme(id) {
@@ -403,6 +487,7 @@ function saveUserThemes() {
     var o = { id: t.id, name: t.name };
     COLOURS.forEach(function (c) { o[c[0]] = t[c[0]]; });
     if (t.photo) o.photo = t.photo;
+    if (t.font) o.font = t.font;
     return o;
   }));
 }
@@ -453,22 +538,100 @@ function dropPhoto(key) {
   photoDel(key).then(null, function () {});
 }
 
-// The photo behind the player: a layer of #mp-app (player.css, "a photo
+// ---- a font file of your own: kept beside the photos, used under a name of its own ----
+// Make the bytes usable as the font "mpf-<key>". Fails when they are not a font.
+function fontUse(key, blob, saved) {
+  return blob.arrayBuffer().then(function (buf) {
+    var family = 'mpf-' + key, ff = new FontFace(family, buf);
+    return ff.load().then(function () {
+      document.fonts.add(ff);
+      USER.fonts[key] = { family: family, ready: true, blob: blob, buf: buf, saved: !!saved, face: ff };
+      if (FLOAT.win) fontsInto(FLOAT.win);
+      applyTheme();
+    });
+  });
+}
+// (Mac) the floating compact player is a document of its own: it needs them too
+function fontsInto(win) {
+  Object.keys(USER.fonts).forEach(function (key) {
+    var rec = USER.fonts[key];
+    if (!rec.ready || !rec.buf) return;
+    try { win.document.fonts.add(new win.FontFace(rec.family, rec.buf)); } catch (e) {}
+  });
+}
+function fontLoad(key) {
+  if (USER.fonts[key]) return;
+  USER.fonts[key] = { family: 'mpf-' + key, ready: false, blob: null, saved: true };
+  photoGet(key).then(function (blob) {
+    if (!blob) { dlog('theme font ' + key + ' is not in the storage'); return null; }
+    return fontUse(key, blob, true);
+  }).then(null, function (e) { dlog('a theme font cannot be used: ' + errText(e)); });
+}
+function fontBlob(key) {
+  var rec = USER.fonts[key];
+  return rec && rec.blob ? Promise.resolve(rec.blob) : photoGet(key);
+}
+function fontForget(key) {                                 // out of this session (the storage is another matter)
+  var rec = USER.fonts[key];
+  if (rec && rec.face) { try { document.fonts.delete(rec.face); } catch (e) {} }
+  delete USER.fonts[key];
+}
+function dropFont(key) {
+  fontForget(key);
+  photoDel(key).then(null, function () {});
+}
+
+// What is behind the player: a layer of #mp-app (player.css, "a photo
 // behind the player"), steered with these variables on the element itself -
-// so it goes along when the player moves to the Mac's floating window.
+// so it goes along when the player moves to the Mac's floating window. A
+// video cannot be a CSS background, so that one is an element of its own
+// (ui.bgv), laid out by the same variables.
 var PHOTO_VARS = ['--mp-photo', '--mp-photo-x', '--mp-photo-y', '--mp-photo-k', '--mp-photo-tint', '--mp-photo-blur', '--mp-glass'];
 function applyPhoto(t) {
   var app = ui.app;
   if (!app) return;
-  var p = t.user ? t.photo : null, rec = p ? USER.photos[p.key] : null;
+  var p = (t.user || t.live) ? t.photo : null, rec = p ? USER.photos[p.key] : null;
   if (p && !rec) loadPhoto(p.key);                       // not read yet: it arrives in a moment
-  var on = !!(p && rec && rec.url);
-  var vals = on ? ['url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', (1 - p.glass / 100).toFixed(2)] : null;
-  var sig = on ? p.fit + '|' + vals.join('|') : '';
-  if (app.__mpPhoto === sig) return;
+  var on = !!(p && rec && rec.url), video = on && p.kind === 'video';
+  var vals = on ? [video ? 'none' : 'url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', (1 - p.glass / 100).toFixed(2)] : null;
+  var sig = on ? p.fit + '|' + p.kind + '|' + rec.url + '|' + vals.join('|') : '';
+  if (app.__mpPhoto === sig) { bgvSync(); return; }
   app.__mpPhoto = sig;
   PHOTO_VARS.forEach(function (name, i) { if (vals) app.style.setProperty(name, vals[i]); else app.style.removeProperty(name); });
-  if (on) app.setAttribute('data-photo', p.fit); else app.removeAttribute('data-photo');
+  if (on) {
+    app.setAttribute('data-photo', p.fit);
+    app.setAttribute('data-photo-kind', t.live ? 'live' : p.kind);
+  } else {
+    app.removeAttribute('data-photo');
+    app.removeAttribute('data-photo-kind');
+  }
+  bgVideo(video ? rec.url : '');
+}
+function bgVideo(url) {
+  var v = ui.bgv;
+  if (!url) {
+    if (!v) return;
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+    v.remove();
+    ui.bgv = null;
+    return;
+  }
+  if (!v) {
+    v = ui.bgv = h('video', { class: 'mp-bgv', 'aria-hidden': 'true', tabindex: '-1', muted: true, loop: true, playsinline: true, disablepictureinpicture: true, preload: 'auto' });
+    v.muted = true;                                      // never any sound: the music is the player's
+    v.loop = true;
+  }
+  if (v.parentNode !== ui.app) ui.app.insertBefore(v, ui.app.firstChild);
+  if (v.getAttribute('src') !== url) v.setAttribute('src', url);
+  bgvSync();
+}
+// it plays only while the player is in sight
+function bgvSync() {
+  var v = ui.bgv, pr;
+  if (!v) return;
+  if (S.seen && deckShown()) {
+    if (v.paused) { try { pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
+  } else if (!v.paused) { try { v.pause(); } catch (e) {} }
 }
 
 // A picture file -> what a theme keeps: the picture no bigger than a large
@@ -480,10 +643,7 @@ function readPhoto(file, keep) {
   if (file.size > 60 * 1024 * 1024) return Promise.reject(new Error('That picture is too big (over 60 MB)'));
   return createImageBitmap(file).then(function (bmp) {
     var k = Math.min(1, PHOTO_MAX / Math.max(bmp.width, bmp.height));
-    var th = document.createElement('canvas'), tk = Math.max(180 / bmp.width, 72 / bmp.height);
-    th.width = 180; th.height = 72;
-    th.getContext('2d').drawImage(bmp, (180 - bmp.width * tk) / 2, (72 - bmp.height * tk) / 2, bmp.width * tk, bmp.height * tk);
-    var thumb = th.toDataURL('image/jpeg', 0.72);
+    var thumb = thumbOf(bmp, bmp.width, bmp.height);
     if (keep && k === 1 && file.type === 'image/webp') { if (bmp.close) bmp.close(); return { blob: file, thumb: thumb }; }
     var c = document.createElement('canvas');
     c.width = Math.max(1, Math.round(bmp.width * k));
@@ -496,6 +656,76 @@ function readPhoto(file, keep) {
       }, 'image/webp', 0.9);
     });
   }, function () { throw new Error('That picture could not be read (try a JPEG or a PNG)'); });
+}
+// the tiny picture shown in the list of themes and in the editor
+function thumbOf(src, w, h0) {
+  var th = document.createElement('canvas'), tk = Math.max(180 / w, 72 / h0);
+  th.width = 180; th.height = 72;
+  th.getContext('2d').drawImage(src, (180 - w * tk) / 2, (72 - h0 * tk) / 2, w * tk, h0 * tk);
+  return th.toDataURL('image/jpeg', 0.72);
+}
+
+// Any file for behind the player -> { blob, thumb, kind }. A photo is scaled
+// as above; a moving picture and a video are kept exactly as they are, once
+// the browser has shown that it can really play them.
+function readBackground(file, keep) {
+  var type = (file && file.type) || '';
+  if (!file) return Promise.reject(new Error('No file was chosen'));
+  if (type.indexOf('video/') === 0) return readVideo(file);
+  if (type && type.indexOf('image/') !== 0) return Promise.reject(new Error('That file is not a picture or a video'));
+  return isMoving(file).then(function (moving) {
+    if (!moving) return readPhoto(file, keep).then(function (r) { r.kind = 'still'; return r; });
+    if (file.size > ANIM_MAX) throw new Error('That moving picture is too big (over 30 MB)');
+    return createImageBitmap(file).then(function (bmp) {
+      var thumb = thumbOf(bmp, bmp.width, bmp.height);
+      if (bmp.close) bmp.close();
+      return { blob: file, thumb: thumb, kind: 'anim' };
+    }, function () { throw new Error('That picture could not be read'); });
+  });
+}
+// does this picture move? (a GIF, an animated WebP or PNG)
+function isMoving(file) {
+  var type = file.type || '';
+  if (!/^image\/(gif|webp|png|apng|avif)$/.test(type) || typeof window.ImageDecoder !== 'function') return Promise.resolve(type === 'image/gif');
+  return file.arrayBuffer().then(function (buf) {
+    var dec = new window.ImageDecoder({ data: buf, type: type });
+    return dec.tracks.ready.then(function () {
+      var tr = dec.tracks.selectedTrack, yes = !!(tr && tr.animated);
+      try { dec.close(); } catch (e) {}
+      return yes;
+    });
+  }).then(null, function () { return false; });
+}
+function readVideo(file) {
+  if (file.size > VIDEO_MAX) return Promise.reject(new Error('That video is too big (over 50 MB) - a short loop works best'));
+  return new Promise(function (ok, no) {
+    var v = document.createElement('video'), url = URL.createObjectURL(file), done = false, timer;
+    function end(thumb) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { v.removeAttribute('src'); v.load(); } catch (e) {}
+      try { URL.revokeObjectURL(url); } catch (e) {}
+      if (thumb) ok({ blob: file, thumb: thumb, kind: 'video' });
+      else no(new Error('That video cannot be played here (an MP4 or a WebM works best)'));
+    }
+    function snap() {
+      if (!v.videoWidth) { end(''); return; }              // (sound only)
+      try { end(thumbOf(v, v.videoWidth, v.videoHeight)); } catch (e) { end(''); }
+    }
+    v.muted = true;
+    v.preload = 'auto';
+    v.playsInline = true;
+    v.onloadeddata = function () {
+      // a little way in: many clips open on a black frame
+      var at = Math.min(1, (isFinite(v.duration) ? v.duration : 0) / 10);
+      if (at > 0.05) { v.onseeked = snap; try { v.currentTime = at; } catch (e) { snap(); } }
+      else snap();
+    };
+    v.onerror = function () { end(''); };
+    timer = setTimeout(function () { end(''); }, 15000);
+    v.src = url;
+  });
 }
 
 // ---- a theme as a file ----
@@ -512,21 +742,55 @@ function photoBlob(key) {
   return rec && rec.blob ? Promise.resolve(rec.blob) : photoGet(key);
 }
 // The .mpskin file for a theme: its name, colours and photo in one piece.
+// version 1: colours and a photo. version 2: also a moving picture or a video
+// behind the player, and lettering (a theme that uses neither stays version 1,
+// so it still opens in a Music Player that has not been updated).
 function skinFile(t) {
-  var out = { format: SKIN_FORMAT, version: 1, name: t.name, colors: {} }, ready = Promise.resolve();
+  var out = { format: SKIN_FORMAT, version: 1, name: t.name, colors: {} }, ready = Promise.resolve(), big = [];
+  // the big pieces (a video can be tens of megabytes) are put into the text
+  // afterwards, at a marker, instead of being copied through JSON.stringify
+  function later(b64) {
+    var mark = 'MPSKIN-PART-' + newId('') + '-' + big.length;
+    big.push({ mark: mark, b64: b64 });
+    return mark;
+  }
   COLOURS.forEach(function (c) { out.colors[c[0]] = t[c[0]]; });
   if (t.photo) {
     ready = photoBlob(t.photo.key).then(function (blob) {
       if (!blob) return null;                              // (its photo is gone: the colours still travel)
       return blobToBase64(blob).then(function (b64) {
-        var p = { type: blob.type || 'image/webp', fit: t.photo.fit };
+        var p = { type: blob.type || 'image/webp', kind: t.photo.kind || 'still', fit: t.photo.fit };
         PHOTO_KNOBS.forEach(function (k) { p[k[0]] = t.photo[k[0]]; });
-        p.data = b64;
+        p.data = later(b64);
         out.photo = p;
+        if (p.kind !== 'still') out.version = 2;
       });
     });
   }
-  return ready.then(function () { return new Blob([JSON.stringify(out)], { type: 'application/json' }); });
+  if (t.font) {
+    ready = ready.then(function () {
+      var f = { lcd: t.font.lcd, ui: t.font.ui };
+      out.font = f;
+      out.version = 2;
+      if (!t.font.own) return null;
+      return fontBlob(t.font.own.key).then(function (blob) {
+        if (!blob) { if (f.lcd === 'own') f.lcd = ''; if (f.ui === 'own') f.ui = ''; return null; }
+        return blobToBase64(blob).then(function (b64) { f.own = { name: t.font.own.name, type: blob.type || 'font/ttf', data: later(b64) }; });
+      });
+    });
+  }
+  return ready.then(function () {
+    var txt = JSON.stringify(out), bits = [], at = 0;
+    big.forEach(function (x) { x.at = txt.indexOf(x.mark); });
+    big.sort(function (a, b) { return a.at - b.at; });
+    big.forEach(function (x) {
+      if (x.at < 0) return;
+      bits.push(txt.slice(at, x.at), x.b64);
+      at = x.at + x.mark.length;
+    });
+    bits.push(txt.slice(at));
+    return new Blob(bits, { type: 'application/json' });
+  });
 }
 function fileNameFor(t) {
   return (t.name.replace(/[\\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim() || 'My theme') + '.mpskin';
@@ -565,43 +829,80 @@ function exportTheme(id) {
   });
 }
 // IMPORT: a .mpskin file -> a new theme in the list (it never replaces one).
+function b64ToBlob(data, type) {
+  var bin = atob(data), bytes = new Uint8Array(bin.length), i;
+  for (i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: type });
+}
 function importSkin(file) {
   if (!file) return Promise.reject(new Error('No file was chosen'));
-  if (file.size > 40 * 1024 * 1024) return Promise.reject(new Error('That file is too big to be a skin'));
+  if (file.size > SKIN_MAX) return Promise.reject(new Error('That file is too big to be a skin'));
   return file.text().then(function (txt) {
-    var d = null, raw, t, ph, blob, bin, bytes, i;
+    var d = null, raw, t, ph, fo, blob = null, fblob = null, fkey = '', trouble = [], bg, ft;
     try { d = JSON.parse(txt); } catch (e) {}
+    txt = '';
     if (!d || typeof d !== 'object' || d.format !== SKIN_FORMAT || !d.colors || typeof d.colors !== 'object')
       throw new Error('That is not a Music Player skin file');
-    if (+d.version > 1) throw new Error('That skin was made with a newer Music Player - update this one first');
+    if (+d.version > 2) throw new Error('That skin was made with a newer Music Player - update this one first');
     raw = { name: d.name };
     COLOURS.forEach(function (c) { raw[c[0]] = d.colors[c[0]]; });
+    fo = d.font && typeof d.font === 'object' ? d.font : null;
+    if (fo) {
+      raw.font = { lcd: fo.lcd, ui: fo.ui };
+      if (fo.own && typeof fo.own === 'object' && typeof fo.own.data === 'string') { fkey = newId('f-'); raw.font.own = { key: fkey, name: fo.own.name }; }
+    }
     t = cleanTheme(raw, false);
     if (!t) throw new Error('That skin file is damaged (its colours cannot be read)');
     t.name = freeName(t.name);
+
+    // what is behind the player: through the same door as a file chosen here,
+    // so it must really be a picture or a video this browser can show
     ph = d.photo;
-    if (!ph || typeof ph !== 'object' || typeof ph.data !== 'string' || !/^image\/(webp|jpeg|png)$/.test(ph.type)) return addTheme(t, null, '');
-    try {
-      bin = atob(ph.data);
-      bytes = new Uint8Array(bin.length);
-      for (i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      blob = new Blob([bytes], { type: ph.type });
-    } catch (e) { return addTheme(t, null, 'ITS PHOTO COULD NOT BE READ'); }
-    // through the same door as a photo chosen here: it must really be a picture
-    return readPhoto(blob, true).then(function (r) {
-      t.photo = cleanPhoto(ph, newId('p-'));
-      t.photo.thumb = r.thumb;
-      return addTheme(t, r.blob, '');
-    }, function () { return addTheme(t, null, 'ITS PHOTO COULD NOT BE READ'); });
+    bg = Promise.resolve(null);
+    if (ph && typeof ph === 'object' && typeof ph.data === 'string' && /^(image\/(webp|jpeg|png|gif|apng|avif)|video\/[a-z0-9.+-]{2,30})$/.test(ph.type)) {
+      try { blob = b64ToBlob(ph.data, ph.type); } catch (e) { blob = null; }
+      ph.data = '';
+      bg = !blob ? Promise.resolve(null) : readBackground(blob, true).then(function (r) {
+        t.photo = cleanPhoto(ph, newId('p-'));
+        t.photo.kind = r.kind;
+        if (r.kind === 'video' && t.photo.fit === 'tile') t.photo.fit = 'cover';
+        t.photo.thumb = r.thumb;
+        return r.blob;
+      }, function () { return null; });
+      bg = bg.then(function (b) { if (!b) trouble.push('ITS PICTURE COULD NOT BE READ'); return b; });
+    }
+
+    // its own font: it must load as a font
+    ft = Promise.resolve(null);
+    if (fkey && t.font && t.font.own) {
+      try { fblob = fo.own.data.length < FONT_MAX * 1.4 ? b64ToBlob(fo.own.data, /^(font|application)\/[a-z0-9.+-]{2,30}$/.test(fo.own.type) ? fo.own.type : 'font/ttf') : null; } catch (e) { fblob = null; }
+      fo.own.data = '';
+      ft = (fblob ? fontUse(fkey, fblob, false) : Promise.reject(new Error('no font'))).then(function () { return fblob; }, function () {
+        delete t.font.own;
+        t.font = cleanFont(t.font);
+        if (!t.font) delete t.font;
+        trouble.push('ITS FONT COULD NOT BE READ');
+        return null;
+      });
+    }
+    return bg.then(function (b) {
+      return ft.then(function (fb) { return addTheme(t, b, trouble.join(', '), fb); });
+    });
   });
 }
-function addTheme(t, blob, trouble) {
-  var done = Promise.resolve(), key = t.photo ? t.photo.key : '';
+function addTheme(t, blob, trouble, fblob) {
+  var done = Promise.resolve(), key = t.photo ? t.photo.key : '', fkey = t.font && t.font.own ? t.font.own.key : '';
   if (key && blob) {
     USER.photos[key] = { url: URL.createObjectURL(blob), blob: blob, saved: false };
     done = photoPut(key, blob).then(function () { USER.photos[key].saved = true; },
-      function (e) { trouble = 'ITS PHOTO WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+      function (e) { trouble = 'ITS PICTURE WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
   } else delete t.photo;
+  if (fkey && fblob) {
+    done = done.then(function () {
+      return photoPut(fkey, fblob).then(function () { if (USER.fonts[fkey]) USER.fonts[fkey].saved = true; },
+        function (e) { trouble = 'ITS FONT WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+    });
+  }
   return done.then(function () {
     USER.list.push(t);
     if (!saveUserThemes()) trouble = 'IT COULD NOT BE KEPT: THE STORAGE IS FULL';
@@ -616,6 +917,7 @@ function deleteTheme(id) {
   USER.list = USER.list.filter(function (x) { return x.id !== id; });
   saveUserThemes();
   if (t.photo) dropPhoto(t.photo.key);
+  if (t.font && t.font.own) dropFont(t.font.own.key);
   renderUserThemes();
   if (S.theme === id) setTheme(store.get('themeBase', 'midnight')); else syncPanel();
 }
@@ -633,6 +935,7 @@ function editOpen(id) {
   if (!d) return;
   USER.draft = d;
   USER.draftPhotoWas = src && src.photo ? src.photo.key : '';
+  USER.draftFontWas = src && src.font && src.font.own ? src.font.own.key : '';
   closePanel();
   editSay('');
   editFill();
@@ -655,14 +958,19 @@ function editFill() {
   for (i = 0; i < els.length; i++) els[i].value = d[els[i].getAttribute('data-c')];
   els = ed.querySelectorAll('[data-hx]');
   for (i = 0; i < els.length; i++) { els[i].value = d[els[i].getAttribute('data-hx')]; els[i].removeAttribute('data-bad'); }
+  editFonts();
   p = d.photo || null;
   ui.edThumb.style.backgroundImage = p && p.thumb ? 'url("' + p.thumb + '")' : 'none';
   ui.edThumb.setAttribute('data-has', p ? '1' : '0');
+  ui.edThumb.setAttribute('data-kind', p ? p.kind : '');
   ui.edNoPhoto.hidden = !p;
   ui.edOpts.hidden = !p;
   if (!p) return;
   els = ed.querySelectorAll('[data-fit]');
-  for (i = 0; i < els.length; i++) els[i].setAttribute('aria-pressed', els[i].getAttribute('data-fit') === p.fit ? 'true' : 'false');
+  for (i = 0; i < els.length; i++) {
+    els[i].setAttribute('aria-pressed', els[i].getAttribute('data-fit') === p.fit ? 'true' : 'false');
+    els[i].disabled = p.kind === 'video' && els[i].getAttribute('data-fit') === 'tile';     // (a video cannot be tiled)
+  }
   els = ed.querySelectorAll('[data-p]');
   for (i = 0; i < els.length; i++) els[i].value = p[els[i].getAttribute('data-p')];
   editVals();
@@ -675,6 +983,20 @@ function editVals() {
     for (j = 0; j < PHOTO_KNOBS.length; j++) if (PHOTO_KNOBS[j][0] === k) els[i].textContent = p ? p[k] + PHOTO_KNOBS[j][5] : '';
   }
 }
+// the lettering: what the two lists offer and show, and the font file's name
+function editFonts() {
+  var d = USER.draft, f = d && d.font, own = f && f.own, els = ui.editor.querySelectorAll('[data-font]'), i, sel, want;
+  for (i = 0; i < els.length; i++) {
+    sel = els[i];
+    want = (f && f[sel.getAttribute('data-font')]) || '';
+    sel.replaceChildren();
+    FONTS.forEach(function (x) { sel.appendChild(h('option', { value: x[0], text: x[1] })); });
+    if (own) sel.appendChild(h('option', { value: 'own', text: 'Yours: ' + own.name }));
+    sel.value = want;
+  }
+  ui.edFontName.textContent = own ? own.name : 'None. A font file of your own (TTF, OTF, WOFF) travels inside the theme.';
+  ui.edNoFont.hidden = !own;
+}
 function editSay(text) {
   if (!ui.edMsg) return;
   ui.edMsg.textContent = text;
@@ -684,6 +1006,14 @@ function onEditInput(e) {
   var d = USER.draft, t = e.target, k, v, pair, j;
   if (!d || !t || !t.getAttribute) return;
   if (t === ui.edName) { d.name = t.value; return; }
+  if ((k = t.getAttribute('data-font'))) {                 // lettering, from one of the two lists
+    if (!d.font) d.font = { lcd: '', ui: '' };
+    d.font[k] = t.value;
+    d.font = cleanFont(d.font);
+    if (!d.font) delete d.font;
+    applyTheme();
+    return;
+  }
   if ((k = t.getAttribute('data-c'))) {                    // a colour, from the picker
     if (!HEX.test(t.value)) return;
     d[k] = t.value.toLowerCase();
@@ -719,19 +1049,52 @@ function editDropPhoto() {
   delete USER.photos[d.photo.key];
 }
 function editPhotoPicked(file) {
-  editSay('READING THE PHOTO...');
-  return readPhoto(file, false).then(function (r) {
+  editSay('READING THE FILE...');
+  return readBackground(file, false).then(function (r) {
     var d = USER.draft, key = newId('p-'), was;
     if (!d) return;
     was = d.photo || {};
     editDropPhoto();
     USER.photos[key] = { url: URL.createObjectURL(r.blob), blob: r.blob, saved: false };
-    d.photo = cleanPhoto(was, key);                        // a new picture keeps the settings of the one before
+    d.photo = cleanPhoto({ kind: r.kind, fit: was.fit, size: was.size, x: was.x, y: was.y, tint: was.tint, blur: was.blur, glass: was.glass }, key);   // a new picture keeps the settings of the one before
     d.photo.thumb = r.thumb;
     editSay('');
     editFill();
     applyTheme();
   }, function (e) { editSay(errText(e)); });
+}
+// a font file that was picked in the editor but never saved goes again
+function editDropFont() {
+  var d = USER.draft, key = d && d.font && d.font.own ? d.font.own.key : '', rec = key ? USER.fonts[key] : null;
+  if (rec && !rec.saved) fontForget(key);
+}
+function editFontPicked(file) {
+  var key = newId('f-');
+  if (!file) return Promise.resolve();
+  if (file.size > FONT_MAX) { editSay('That font file is too big (over 12 MB)'); return Promise.resolve(); }
+  editSay('READING THE FONT...');
+  return fontUse(key, file, false).then(function () {
+    var d = USER.draft, f;
+    if (!d) { fontForget(key); return; }
+    editDropFont();
+    f = d.font || { lcd: '', ui: '' };
+    f.own = { key: key, name: cleanName(String(file.name || '').replace(/\.[a-z0-9]{2,5}$/i, ''), 'Font') };
+    if (f.lcd !== 'own' && f.ui !== 'own') f.lcd = 'own';     // straight onto the displays, where it shows most
+    d.font = f;
+    editSay('');
+    editFonts();
+    applyTheme();
+  }, function () { editSay('That file is not a font this app can use (try a TTF, OTF or WOFF file)'); });
+}
+function editNoFont() {
+  var d = USER.draft;
+  if (!d || !d.font || !d.font.own) return;
+  editDropFont();
+  delete d.font.own;
+  d.font = cleanFont(d.font);
+  if (!d.font) delete d.font;
+  editFonts();
+  applyTheme();
 }
 function editNoPhoto() {
   var d = USER.draft;
@@ -748,14 +1111,21 @@ function editSave() {
   rec = d.photo ? USER.photos[d.photo.key] : null;
   if (rec && !rec.saved && rec.blob)
     put = photoPut(d.photo.key, rec.blob).then(function () { rec.saved = true; },
-      function (e) { trouble = 'ITS PHOTO WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+      function (e) { trouble = 'ITS PICTURE WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+  put = put.then(function () {
+    var fr = d.font && d.font.own ? USER.fonts[d.font.own.key] : null;
+    if (!fr || fr.saved || !fr.blob) return null;
+    return photoPut(d.font.own.key, fr.blob).then(function () { fr.saved = true; },
+      function (e) { trouble = 'ITS FONT WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+  });
   return put.then(function () {
-    var at = -1, i, old = USER.draftPhotoWas;
+    var at = -1, i, old = USER.draftPhotoWas, oldFont = USER.draftFontWas;
     if (USER.draft !== d) return;
     for (i = 0; i < USER.list.length; i++) if (USER.list[i].id === d.id) at = i;
     if (at >= 0) USER.list[at] = d; else USER.list.push(d);
     if (!saveUserThemes()) trouble = 'IT COULD NOT BE KEPT: THE STORAGE IS FULL';
     if (old && (!d.photo || d.photo.key !== old)) dropPhoto(old);     // the photo it had before is no longer used
+    if (oldFont && (!d.font || !d.font.own || d.font.own.key !== oldFont)) dropFont(oldFont);
     USER.draft = null;
     editHide();
     renderUserThemes();
@@ -767,6 +1137,7 @@ function editSave() {
 function editCancel() {
   if (!USER.draft) return;
   editDropPhoto();
+  editDropFont();
   USER.draft = null;
   editHide();
   retheme();
@@ -785,7 +1156,7 @@ function swatchFor(t) {
   var prev = h('div', { class: 'mp-swatch-prev' });
   var dot = h('div', { class: 'mp-swatch-dot' }), lcd = h('div', { class: 'mp-swatch-lcd' });
   var body = 'linear-gradient(180deg,' + t.shellA + ',' + t.shellB + ')', a;
-  if (t.user && t.photo && t.photo.thumb) {
+  if ((t.user || t.live) && t.photo && t.photo.thumb) {
     a = (t.photo.tint / 100).toFixed(2);
     body = 'linear-gradient(180deg,rgba(' + hexToRgb(t.shellA).join(',') + ',' + a + '),rgba(' + hexToRgb(t.shellB).join(',') + ',' + a + ')),' +
       'url("' + t.photo.thumb + '") center/cover';
@@ -830,6 +1201,268 @@ function disarmDelete() {
   if (!ui.userDelete) return;
   ui.userDelete.removeAttribute('data-arm');
   ui.userDelete.querySelector('span').textContent = 'DELETE';
+}
+
+// The clock is sized for the skin's own digits. Other lettering can be wider,
+// so it is made smaller until "-88:88" fits its display.
+function fitClock() {
+  var el = ui.time, cs, room, w, c;
+  if (!el || !el.parentNode || !deckShown()) return;
+  el.style.fontSize = '';
+  try {
+    cs = getComputedStyle(el);
+    room = el.parentNode.clientWidth - 18 - 18 - 6 - 3;       // padding, the state sign, the gap
+    c = fitClock.c || (fitClock.c = document.createElement('canvas').getContext('2d'));
+    c.font = cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+    w = c.measureText('-88:88').width;
+    if (room > 40 && w > room) el.style.fontSize = Math.max(14, Math.floor(parseFloat(cs.fontSize) * room / w)) + 'px';
+  } catch (e) {}
+}
+
+// ============================================================================
+// The cover
+// The picture of the song that is playing is read once per song. From it come
+//   - six colours for the "Album cover" theme, which glides from one song's
+//     colours to the next, with the cover itself, blurred, behind the player
+//   - a small copy for the Windows app's "now playing" card
+// Apple's picture server allows other pages to read the pixels; where a
+// picture cannot be read (some uploaded songs), the theme keeps the colours of
+// the last built-in theme and the card shows no picture.
+// ============================================================================
+function baseTheme() {
+  var id = store.get('themeBase', 'midnight'), i;
+  for (i = 0; i < THEMES.length; i++) if (THEMES[i].id === id) return THEMES[i];
+  return THEMES[0];
+}
+(function () { var b = baseTheme(); COLOURS.forEach(function (c) { COVER.t[c[0]] = b[c[0]]; }); })();
+
+function hexOf(r, g, b) { return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1); }
+function mixHex(a, b, t) {                // t = share of colour a
+  var x = hexToRgb(a), y = hexToRgb(b);
+  return hexOf(Math.round(x[0] * t + y[0] * (1 - t)), Math.round(x[1] * t + y[1] * (1 - t)), Math.round(x[2] * t + y[2] * (1 - t)));
+}
+function rgbToHsl(r, g, b) {              // -> [hue 0..360, saturation 0..1, lightness 0..1]
+  r /= 255; g /= 255; b /= 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn, hh = 0, s = 0;
+  if (d > 1e-6) {
+    s = d / (1 - Math.abs(2 * l - 1));
+    hh = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    hh *= 60;
+    if (hh < 0) hh += 360;
+  }
+  return [hh, Math.min(1, s), l];
+}
+function hslHex(hh, s, l) {
+  var c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((hh / 60) % 2 - 1)), m = l - c / 2, r = 0, g = 0, b = 0;
+  if (hh < 60) { r = c; g = x; } else if (hh < 120) { r = x; g = c; } else if (hh < 180) { g = c; b = x; }
+  else if (hh < 240) { g = x; b = c; } else if (hh < 300) { r = x; b = c; } else { r = c; b = x; }
+  return hexOf(Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255));
+}
+
+// A cover's pixels (RGBA) -> the six colours of a theme. The body takes the
+// colour there is most of (colourful ones count for more than black, white and
+// grey), the lamps a strong colour away from it; lightness is always set here,
+// so the lettering stays readable whatever the cover.
+function coverPalette(px) {
+  var bins = {}, keys, i, k, o, n = 0, body = null, acc = null, best = -1;
+  for (i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 128) continue;
+    k = ((px[i] >> 5) << 6) | ((px[i + 1] >> 5) << 3) | (px[i + 2] >> 5);
+    o = bins[k] || (bins[k] = { n: 0, r: 0, g: 0, b: 0 });
+    o.n++; o.r += px[i]; o.g += px[i + 1]; o.b += px[i + 2];
+    n++;
+  }
+  if (!n) return null;
+  keys = Object.keys(bins);
+  keys.forEach(function (key) {
+    var q = bins[key], sc;
+    q.hsl = rgbToHsl(q.r / q.n, q.g / q.n, q.b / q.n);
+    sc = q.n * (0.22 + q.hsl[1]) * (q.hsl[2] > 0.1 && q.hsl[2] < 0.88 ? 1 : 0.3);
+    if (sc > best) { best = sc; body = q; }
+  });
+  best = 0;
+  keys.forEach(function (key) {
+    var q = bins[key], s = q.hsl[1], l = q.hsl[2], d, sc;
+    if (q === body || q.n < 2 || s < 0.28 || l < 0.2 || l > 0.88) return;
+    d = Math.abs(q.hsl[0] - body.hsl[0]);
+    if (d > 180) d = 360 - d;
+    sc = Math.sqrt(q.n) * s * (body.hsl[1] < 0.12 ? 1 : Math.min(1, d / 90));
+    if (sc > best) { best = sc; acc = q; }
+  });
+  var H = body.hsl[0], S0 = body.hsl[1], grey = S0 < 0.1, sb = grey ? S0 * 0.6 : Math.min(0.62, Math.max(0.28, S0));
+  var out = {
+    shellA: hslHex(H, sb, 0.3), shellB: hslHex(H, sb, 0.16), shellText: hslHex(H, Math.min(sb, 0.45), 0.92),
+    lcdBg: hslHex(H, Math.min(sb, 0.6), 0.05)
+  };
+  if (grey && !acc) { out.lit = '#f1f1f4'; out.lcdFg = '#dfe0e6'; }
+  else {
+    out.lit = acc ? hslHex(acc.hsl[0], Math.max(0.78, acc.hsl[1]), Math.max(0.6, Math.min(0.7, acc.hsl[2]))) : hslHex(H, 0.85, 0.68);
+    out.lcdFg = grey ? hslHex(acc.hsl[0], 0.6, 0.8) : hslHex(H, Math.max(0.5, Math.min(0.9, S0)), 0.77);
+  }
+  return out;
+}
+
+// Called whenever the playing song may have changed, with its artwork address
+// (a template with {w}x{h} in it), or '' when there is none.
+function coverTrack(tpl) {
+  tpl = tpl || '';
+  if (tpl === COVER.key) return;
+  COVER.key = tpl;
+  COVER.jpeg = '';
+  var tok = ++COVER.tok, url, img;
+  function none() { COVER.pal = null; COVER.big = ''; coverAim(); npSync(); }
+  if (!/^https:\/\//.test(tpl)) { none(); return; }
+  url = tpl.replace('{w}', 300).replace('{h}', 300).replace('{f}', 'jpg').replace('{c}', 'bb');
+  img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = function () {
+    if (tok !== COVER.tok) return;                       // another song since
+    try {
+      var c = document.createElement('canvas'), s = document.createElement('canvas'), g;
+      c.width = c.height = 96;
+      c.getContext('2d').drawImage(img, 0, 0, 96, 96);
+      s.width = s.height = 24;
+      g = s.getContext('2d', { willReadFrequently: true });
+      g.drawImage(img, 0, 0, 24, 24);
+      COVER.pal = coverPalette(g.getImageData(0, 0, 24, 24).data);
+      COVER.jpeg = (c.toDataURL('image/jpeg', 0.82).split(',')[1] || '').slice(0, 30000);
+      COVER.big = url;
+    } catch (e) { COVER.pal = null; COVER.jpeg = ''; COVER.big = ''; }
+    coverAim();
+    npSync();
+  };
+  img.onerror = function () { if (tok === COVER.tok) none(); };
+  img.src = url;
+}
+// what the theme should look like for the song playing now
+function coverLook() {
+  var to = COVER.pal || baseTheme(), t = { id: 'cover', name: COVER.t.name, jp: COVER.t.jp, live: true };
+  COLOURS.forEach(function (c) { t[c[0]] = to[c[0]]; });
+  if (COVER.big) {
+    t.photo = { key: 'cover', kind: 'still', fit: 'cover', size: 130, x: 50, y: 50, tint: 62, blur: 24, glass: 24,
+      thumb: COVER.jpeg ? 'data:image/jpeg;base64,' + COVER.jpeg : '' };
+  }
+  return t;
+}
+// Head for those colours: at once while the theme is not in use (or nobody is
+// looking), gliding over about a second while it is.
+function coverAim() {
+  var to = coverLook(), same = true, was = {};
+  COLOURS.forEach(function (c) { was[c[0]] = COVER.t[c[0]]; if (was[c[0]] !== to[c[0]]) same = false; });
+  if (to.photo) { COVER.t.photo = to.photo; USER.photos.cover = { url: COVER.big, blob: null, saved: true }; }
+  else delete COVER.t.photo;
+  coverSwatch(to);
+  if (S.theme !== 'cover' || USER.draft || !S.seen || same) {
+    COLOURS.forEach(function (c) { COVER.t[c[0]] = to[c[0]]; });
+    COVER.from = COVER.to = null;
+    if (S.theme === 'cover' && !USER.draft) retheme();
+    return;
+  }
+  COVER.from = was;
+  COVER.to = to;
+  COVER.t0 = 0;
+  applyTheme();                                          // the picture behind changes now; the colours follow
+  if (!COVER.raf) COVER.raf = nextFrame(coverStep);
+}
+function coverStep(now) {
+  COVER.raf = 0;
+  if (!COVER.to) return;
+  if (!COVER.t0) COVER.t0 = now;
+  var k = S.seen ? Math.min(1, Math.max(0, (now - COVER.t0) / 900)) : 1, e = k * k * (3 - 2 * k), on = S.theme === 'cover' && !USER.draft;
+  COLOURS.forEach(function (c) { COVER.t[c[0]] = k === 1 ? COVER.to[c[0]] : mixHex(COVER.to[c[0]], COVER.from[c[0]], e); });
+  if (on) {
+    applyTheme();
+    vizColors();
+    vzColors();
+    kickViz();
+    if (k === 1 || ++COVER.n % 8 === 0) notifyHost();     // the title bar follows in a few steps
+  }
+  if (k < 1) { COVER.raf = nextFrame(coverStep); return; }
+  COVER.from = COVER.to = null;
+  if (on) npSync();
+}
+// its key in the themes panel shows the cover and the colours of the moment
+function coverSwatch(look) {
+  if (!ui.coverSw) return;
+  var sw = swatchFor(look || coverLook());
+  ui.coverSw.replaceWith(sw);
+  ui.coverSw = sw;
+  sw.setAttribute('aria-pressed', S.theme === 'cover' && !USER.draft ? 'true' : 'false');
+}
+
+// ============================================================================
+// Now playing, for the app
+// The Windows app can do two things with the song that is playing while the
+// listener is busy with something else (src\NowPlaying.cs):
+//   - show a small card over whatever is in front when the song changes
+//   - show the song on the listener's Discord profile
+// The app says what it can do ("caps|popup,discord"); from then on the page
+// tells it the settings and, on every change, the song:
+//   popup|<0/1>|<corner tl/tr/bl/br>          popup|test  shows a card now
+//   discord|<0/1>|<application id>
+//   np|<state>|... with the fields below separated by the character 0x1F:
+//      state (play / pause / stop), which song (id@place in the queue),
+//      title, artist, album, length in ms, position in ms, address of the
+//      cover, the theme's six colours, a small JPEG of the cover (base64)
+// The app answers "discord|<state>" for the settings panel to show.
+// ============================================================================
+var NP = { caps: '', last: '', st: '', pos: 0, posAt: 0, dc: '', idTimer: 0, timer: 0 };
+var US = '\u001f';
+function npClean(s, max) { return String(s || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max || 160); }
+function npId() { return /^\d{15,22}$/.test(S.discordId) ? S.discordId : ''; }
+
+function npCaps(list) {
+  NP.caps = list;
+  document.documentElement.setAttribute('data-mp-caps', list.replace(/[^a-z]+/g, ' ').trim());
+  npSettings();
+  NP.last = '';
+  npSend();
+  syncPanel();
+}
+function npSettings() {
+  if (!NP.caps) return;
+  send('popup|' + (S.popup ? 1 : 0) + '|' + S.popupPos);
+  send('discord|' + (S.discord && npId() ? 1 : 0) + '|' + npId());
+}
+// Called from wherever something about the song may have changed. The telling
+// itself happens a moment later, once: a change of song arrives in pieces (the
+// place in the queue, the song, its state), and the app wants the outcome.
+function npSync() {
+  if (HOST_KIND !== 'windows' || !NP.caps || !ui.app || NP.timer) return;
+  NP.timer = setTimeout(npSend, 220);
+}
+function npSend() {
+  clearTimeout(NP.timer);
+  NP.timer = 0;
+  if (HOST_KIND !== 'windows' || !NP.caps || !ui.app) return;
+  var it = nowItem(), info = itemInfo(it), now = performance.now(), pos = 0;
+  var st = !it ? 'stop' : S.stable === 'playing' ? 'play' : S.stable === 'paused' ? 'pause' : 'stop';
+  var look = S.theme === 'cover' && !USER.draft ? (COVER.to || COVER.t) : themeNow();
+  var cols = COLOURS.map(function (c) { return look[c[0]].slice(1); }).join(',');
+  var art = it && /^https:\/\//.test(info.art) ? info.art.replace('{w}', 512).replace('{h}', 512).replace('{f}', 'jpg').replace('{c}', 'bb') : '';
+  var jpeg = it && info.art && COVER.key === info.art ? COVER.jpeg : '';
+  try { pos = Math.round((S.music.currentPlaybackTime || 0) * 1000); } catch (e) {}
+  var head = [st, it ? curKey() : '', npClean(it ? info.title : ''), npClean(info.artist), npClean(info.album), Math.round(info.dur * 1000)].join(US);
+  var sig = head + US + (jpeg ? 1 : 0) + US + cols;
+  // the position is only worth a message when it is not where the last one
+  // said it would be by now (the listener moved through the song)
+  var expect = NP.pos + (NP.st === 'play' ? now - NP.posAt : 0);
+  if (sig === NP.last && Math.abs(expect - pos) < 2500) return;
+  NP.last = sig;
+  NP.st = st;
+  NP.pos = pos;
+  NP.posAt = now;
+  send('np|' + head + US + pos + US + npClean(art, 400) + US + cols + US + jpeg);
+}
+// what the settings panel says about Discord
+function npDiscordText() {
+  if (!S.discord) return '';
+  if (!npId()) return 'PASTE THE APPLICATION ID (17 TO 20 DIGITS)';
+  return NP.dc === 'on' ? 'CONNECTED TO DISCORD'
+    : NP.dc === 'wait' ? 'DISCORD IS NOT RUNNING ON THIS PC'
+    : NP.dc === 'bad' ? 'DISCORD DID NOT ACCEPT THAT ID'
+    : NP.dc === 'err' ? 'DISCORD CANNOT BE REACHED'
+    : 'CONNECTING...';
 }
 
 // ------------------------------------------------------ playback (MusicKit) --
@@ -1005,6 +1638,7 @@ function refreshState() {
     vzKick();
     lyKick();
   }
+  npSync();
 }
 
 function refreshTime() {
@@ -1019,6 +1653,7 @@ function refreshTime() {
   if (S.dragSeek === null) setSlider(ui.seek, d ? t / d : 0);
   ui.seek.setAttribute('data-disabled', idle || !d ? '1' : '0');
   ui.seek.setAttribute('aria-valuetext', fmt(t) + ' of ' + fmt(d));
+  if (S.dragSeek === null) npSync();
 }
 
 function refreshItem() {
@@ -1043,6 +1678,7 @@ function refreshItem() {
   ui.art.setAttribute('data-empty', it && info.art ? '0' : '1');
   ui.art.style.visibility = art ? 'visible' : 'hidden';
   if (ui.chipAdd) ui.chipAdd.hidden = !it;
+  coverTrack(it ? info.art : '');
 
   send('title|' + (it ? info.title + (info.artist ? ' - ' + info.artist : '') : ''));
   refreshChips();
@@ -1329,23 +1965,84 @@ function vizFrame(now) {
   g.clearRect(0, 0, w, ht);
   var gap = Math.max(1, Math.round(1.5 * dpr));
   var bw = (w - gap * (n - 1)) / n;
-  var seg = Math.max(2, Math.round(3 * dpr)), segGap = Math.max(1, Math.round(dpr));
-  var rows = Math.max(1, Math.floor((ht + segGap) / (seg + segGap)));
-  for (i = 0; i < n; i++) {
-    var x = Math.round(i * (bw + gap)), bwi = Math.max(1, Math.round(bw));
-    var lit = Math.round(viz.cur[i] * rows);
-    for (var r = 0; r < rows; r++) {
-      g.fillStyle = r < lit ? (r >= rows * 0.72 ? viz.hot : viz.fg) : viz.off;
-      g.fillRect(x, ht - (r + 1) * (seg + segGap) + segGap, bwi, seg);
+  var x, bwi, moving = false;
+
+  if (S.meter === 'scope') {
+    // the waveform itself, as on an oscilloscope
+    var wl = AU.waveL, wr = AU.waveR, mid = ht / 2, amp = ht * 0.48, v, top2 = 0;
+    g.fillStyle = viz.off;
+    g.fillRect(0, Math.round(mid), w, Math.max(1, Math.round(dpr)));
+    g.beginPath();
+    for (i = 0; i < 256; i++) {
+      v = (wl[i * 2] + wr[i * 2]) * 0.5;
+      if (v > top2) top2 = v; else if (-v > top2) top2 = -v;
+      v = mid - Math.max(-1, Math.min(1, v * 3)) * amp;
+      if (i) g.lineTo(i * w / 255, v); else g.moveTo(0, v);
     }
-    if (viz.peak[i] > 0.03) {
-      var pr = Math.min(rows - 1, Math.round(viz.peak[i] * rows));
-      g.fillStyle = viz.hot;
-      g.fillRect(x, ht - (pr + 1) * (seg + segGap) + segGap, bwi, Math.max(1, Math.round(seg / 2)));
+    g.strokeStyle = viz.fg;
+    g.lineWidth = Math.max(1, 1.4 * dpr);
+    g.lineJoin = 'round';
+    g.shadowColor = viz.fg;
+    g.shadowBlur = 4 * dpr;
+    g.stroke();
+    g.shadowBlur = 0;
+    moving = top2 > 0.004;
+  } else if (S.meter === 'classic') {
+    // solid bars that run from green through yellow to red, with falling caps
+    if (!viz.grad || viz.gradH !== ht) {
+      viz.grad = g.createLinearGradient(0, ht, 0, 0);
+      viz.grad.addColorStop(0, '#16860a');
+      viz.grad.addColorStop(0.3, '#2fce12');
+      viz.grad.addColorStop(0.58, '#d8de28');
+      viz.grad.addColorStop(0.8, '#d67a04');
+      viz.grad.addColorStop(1, '#ef3110');
+      viz.gradH = ht;
+    }
+    var step = Math.max(1, Math.round(2 * dpr)), cap = Math.max(1, Math.round(1.5 * dpr)), bh, py;
+    for (i = 0; i < n; i++) {
+      x = Math.round(i * (bw + gap)); bwi = Math.max(1, Math.round(bw));
+      bh = Math.round(viz.cur[i] * ht / step) * step;          // in steps, like the rows of an old display
+      if (bh > 0) { g.fillStyle = viz.grad; g.fillRect(x, ht - bh, bwi, bh); }
+      py = Math.round(viz.peak[i] * ht / step) * step;
+      if (viz.peak[i] > 0.03) { g.fillStyle = '#c9c9cf'; g.fillRect(x, Math.max(0, ht - py - cap), bwi, cap); }
+    }
+  } else {
+    // rows of lamps in the theme's own ink
+    var seg = Math.max(2, Math.round(3 * dpr)), segGap = Math.max(1, Math.round(dpr));
+    var rows = Math.max(1, Math.floor((ht + segGap) / (seg + segGap)));
+    for (i = 0; i < n; i++) {
+      x = Math.round(i * (bw + gap)); bwi = Math.max(1, Math.round(bw));
+      var lit = Math.round(viz.cur[i] * rows);
+      for (var r = 0; r < rows; r++) {
+        g.fillStyle = r < lit ? (r >= rows * 0.72 ? viz.hot : viz.fg) : viz.off;
+        g.fillRect(x, ht - (r + 1) * (seg + segGap) + segGap, bwi, seg);
+      }
+      if (viz.peak[i] > 0.03) {
+        var pr = Math.min(rows - 1, Math.round(viz.peak[i] * rows));
+        g.fillStyle = viz.hot;
+        g.fillRect(x, ht - (pr + 1) * (seg + segGap) + segGap, bwi, Math.max(1, Math.round(seg / 2)));
+      }
     }
   }
-  if (playing || energy > 0.02) viz.raf = nextFrame(vizFrame);
+  if (playing || energy > 0.02 || moving) viz.raf = nextFrame(vizFrame);
   else viz.last = 0;
+}
+
+// Click the small display to change what it shows.
+var METERS = [['led', 'LAMPS'], ['classic', 'CLASSIC BARS'], ['scope', 'SCOPE']];
+function meterNext() {
+  var at = 0, i;
+  for (i = 0; i < METERS.length; i++) if (METERS[i][0] === S.meter) at = i;
+  at = (at + 1) % METERS.length;
+  S.meter = METERS[at][0];
+  store.set('meter', S.meter);
+  meterTitle();
+  kickViz();
+}
+function meterTitle() {
+  var name = 'LAMPS', i;
+  for (i = 0; i < METERS.length; i++) if (METERS[i][0] === S.meter) name = METERS[i][1];
+  if (ui.viz) ui.viz.title = 'Showing: ' + name + '. Click to change (lamps, classic bars, scope)';
 }
 
 // ============================================================================
@@ -1425,6 +2122,8 @@ function onHostMessage(e) {
     if (AU.tapState.lastIndexOf('failed', 0) === 0) dlog('sound capture ' + AU.tapState);
     vzStatus();
   }
+  else if (d.lastIndexOf('caps|', 0) === 0) npCaps(d.slice(5, 80));
+  else if (d.lastIndexOf('discord|', 0) === 0) { NP.dc = d.slice(8, 20); syncPanel(); }
 }
 
 // The window went out of sight (minimised, covered by a game) or came back.
@@ -1434,6 +2133,7 @@ function setSeen(on) {
   if (S.seen === on) return;
   S.seen = on;
   document.documentElement.setAttribute('data-mp-seen', on ? '1' : '0');
+  bgvSync();
   if (!on) return;
   VZ.last = 0;
   AU.playAt = performance.now();      // the sound capture needs a moment to start again: no stand-in tune meanwhile
@@ -4562,6 +5262,7 @@ function floatMove(win) {
   }
   doc.title = 'Music Player';
   doc.documentElement.setAttribute('data-mp-floating', '1');
+  fontsInto(win);
   applyTheme();
   doc.body.appendChild(ui.root);
   floatFresh();
@@ -4717,6 +5418,10 @@ var ACT = {
   editcancel: function () { editCancel(); },
   editphoto: function () { if (ui.edFile) { ui.edFile.value = ''; ui.edFile.click(); } },
   editnophoto: function () { editNoPhoto(); },
+  editfont: function () { if (ui.edFontFile) { ui.edFontFile.value = ''; ui.edFontFile.click(); } },
+  editnofont: function () { editNoFont(); },
+  meter: function () { meterNext(); },
+  poptest: function () { npSettings(); NP.last = ''; npSend(); send('popup|test'); },
   ontop: function () { setOnTop(!S.onTop); },
   pl: function () { setPanel('pl', !S.showPl); },
   viz: function () { setPanel('viz', !S.showViz); },
@@ -4803,6 +5508,7 @@ function setMode(mode) {
 
   if (mode === 'apple') {
     send('tap|0');
+    bgvSync();
     watchApple(true);
     // Apple's page was not being drawn; let it measure itself again
     setTimeout(function () { placeControls(); try { window.dispatchEvent(new Event('resize')); } catch (e) {} }, 60);
@@ -4818,7 +5524,7 @@ function setMode(mode) {
     // sizes changed with the window: let lists and the song line re-measure
     setTimeout(function () { if (S.mode === 'full') { renderView(); setMarquee(S.marquee, true); } }, 80);
   }
-  setTimeout(function () { kickViz(); vzKick(); lyRefresh(); lyKick(); }, 150);
+  setTimeout(function () { kickViz(); vzKick(); lyRefresh(); lyKick(); fitClock(); bgvSync(); }, 150);
 }
 
 // The compact window is as tall as what is open in it: the deck alone, or the
@@ -4926,7 +5632,8 @@ function buildApp() {
 
   // ---- deck ----
   ui.time = h('button', { class: 'mpc-time', 'data-act': 'timemode', title: 'Click to switch between elapsed and remaining time', type: 'button', text: '--:--' });
-  ui.viz = h('canvas', { class: 'mpc-viz', 'aria-hidden': 'true' });
+  ui.viz = h('canvas', { class: 'mpc-viz', 'data-act': 'meter', role: 'button', 'aria-label': 'Change what the small display shows' });
+  meterTitle();
   var clockLcd = h('div', { class: 'mpc-lcd mpc-clock' },
     h('div', { class: 'mpc-state' }, svg(I.play, 's-play'), svg(I.pause, 's-pause'), svg(I.stop, 's-stop')),
     ui.time, ui.viz);
@@ -5189,6 +5896,9 @@ function buildPanel() {
   var body = h('div', { class: 'mp-panel-body' });
   var grid = h('div', { class: 'mp-themes' });
   THEMES.forEach(function (t) { grid.appendChild(swatchFor(t)); });
+  // the one that takes its colours from the cover of the song playing
+  ui.coverSw = swatchFor(coverLook());
+  grid.appendChild(ui.coverSw);
   body.appendChild(grid);
 
   // ---- themes of your own: make, pick, edit, and carry to another computer ----
@@ -5226,6 +5936,45 @@ function buildPanel() {
     h('span', { text: HOST_KIND === 'mac' ? 'Keep the compact player on top of other windows (it floats in a small window of its own, above every app)'
       : 'Keep the compact player above everything - fullscreen browsers, and games set to windowed fullscreen' }),
     h('span', { class: 'mp-switch' }, h('i', { class: 'mp-led' }))));
+
+  // ---- while something else is in front (the Windows app says when it can:
+  //      data-mp-caps): the "now playing" card, and Discord ----
+  var optSwitch = function (key, text) {
+    return h('button', { class: 'mp-opt', 'data-opt': key, type: 'button', role: 'switch', 'aria-checked': 'false' },
+      h('span', { text: text }), h('span', { class: 'mp-switch' }, h('i', { class: 'mp-led' })));
+  };
+  var away = h('div', { class: 'mp-away-opts' });
+  away.appendChild(h('div', { class: 'mp-panel-sub' }, h('span', { text: 'WHILE YOU PLAY' }), jp('ゲーム中'), h('span', { class: 'mp-grip' })));   // "in a game"
+  away.appendChild(optSwitch('popup', 'Show a small "now playing" card when the song changes, over whatever is in front - a game set to windowed fullscreen too'));
+  ui.popRow = h('div', { class: 'mp-opt-more' });
+  [['tl', 'TOP LEFT'], ['tr', 'TOP RIGHT'], ['bl', 'BOTTOM LEFT'], ['br', 'BOTTOM RIGHT']].forEach(function (x) {
+    ui.popRow.appendChild(h('button', { class: 'mp-key mpe-fit', type: 'button', 'data-pop': x[0], 'aria-pressed': 'false', title: 'The corner of the screen the card slides into', text: x[1] }));
+  });
+  ui.popRow.appendChild(textKey('poptest', 'SHOW ONE', '表示', 'Show the card now, to see where it lands'));
+  away.appendChild(ui.popRow);
+  away.appendChild(optSwitch('discord', 'Show the song you are listening to on your Discord profile'));
+  ui.dcId = h('input', { class: 'mpm-input mp-dc-id', type: 'text', inputmode: 'numeric', maxlength: '22', spellcheck: 'false', autocomplete: 'off',
+    placeholder: 'Application ID', 'aria-label': 'Discord application ID' });
+  ui.dcId.value = S.discordId;
+  ui.dcId.addEventListener('input', function () {
+    S.discordId = ui.dcId.value.replace(/\D+/g, '').slice(0, 22);
+    if (ui.dcId.value !== S.discordId) ui.dcId.value = S.discordId;
+    store.set('discordId', S.discordId);
+    NP.dc = '';
+    syncPanel();
+    clearTimeout(NP.idTimer);
+    NP.idTimer = setTimeout(function () { npSettings(); NP.last = ''; npSend(); }, 700);
+  });
+  ui.dcState = h('div', { class: 'mp-user-msg mp-dc-state', role: 'status' });
+  ui.dcRow = h('div', { class: 'mp-dc' },
+    h('label', { class: 'mp-opt-more' }, h('span', { class: 'mp-opt-label', text: 'Application ID' }), ui.dcId),
+    ui.dcState,
+    h('div', { class: 'mp-hint', text: 'Discord shows a song under an "application" of yours. Make one once: at discord.com/developers/applications press ' +
+      'New Application and give it the name your friends should see (it reads "Listening to" and that name), then copy its Application ID into the box. ' +
+      'While this is on, the title, artist, album and cover of what you play go to Discord.' }));
+  away.appendChild(ui.dcRow);
+  body.appendChild(away);
+
   body.appendChild(h('div', { class: 'mp-hint' },
     h('span', { class: 'mp-kbd', text: 'Ctrl+M' }), h('span', { text: ' compact / full    ' }),
     h('span', { class: 'mp-kbd', text: '/' }), h('span', { text: ' search    ' }),
@@ -5248,6 +5997,23 @@ function buildPanel() {
       var key = opt.getAttribute('data-opt');
       if (key === 'onTop') setOnTop(!S.onTop);
       else if (key === 'autoCompact') { S.autoCompact = !S.autoCompact; store.set('autoCompact', S.autoCompact); syncPanel(); }
+      else if (key === 'popup' || key === 'discord') {
+        S[key] = !S[key];
+        store.set(key, S[key]);
+        NP.dc = '';
+        syncPanel();
+        npSettings();
+        NP.last = '';
+        npSend();
+      }
+      return;
+    }
+    var pop = e.target.closest('[data-pop]');
+    if (pop) {
+      S.popupPos = pop.getAttribute('data-pop');
+      store.set('popupPos', S.popupPos);
+      syncPanel();
+      npSettings();
       return;
     }
     onActClick(e);
@@ -5280,12 +6046,31 @@ function buildEditor() {
         'aria-label': c[1] + ', as a colour code', title: 'Or type a colour code, like #ff4fa3' })));
   });
 
-  body.appendChild(sub('PHOTO', '写真'));
+  // ---- lettering: one of the fonts every computer has, or a font file of your own ----
+  body.appendChild(sub('LETTERING', '文字'));
+  FONT_ROLES.forEach(function (r) {
+    body.appendChild(h('label', { class: 'mpe-row' }, h('span', { class: 'mpe-label', text: r[1] }),
+      h('select', { class: 'mpm-input mpe-select', 'data-font': r[0], 'aria-label': 'Lettering for ' + r[1].toLowerCase() })));
+  });
+  ui.edFontName = h('span', { class: 'mpe-font-name' });
+  ui.edNoFont = textKey('editnofont', 'REMOVE', '削除', 'Take the font file out of this theme');
+  body.appendChild(h('div', { class: 'mpe-font' }, ui.edFontName,
+    h('div', { class: 'mpe-photo-keys' },
+      textKey('editfont', 'CHOOSE FONT FILE', '選択', 'Use a font file from this computer (TTF, OTF, WOFF). It is kept inside the theme, so it travels with it', I.plus),
+      ui.edNoFont)));
+  ui.edFontFile = h('input', { type: 'file', accept: '.ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
+  ui.edFontFile.addEventListener('change', function () {
+    if (ui.edFontFile.files && ui.edFontFile.files[0]) editFontPicked(ui.edFontFile.files[0]);
+  });
+  body.appendChild(ui.edFontFile);
+
+  body.appendChild(sub('BEHIND THE PLAYER', '背景'));
   ui.edThumb = h('div', { class: 'mpe-thumb', 'data-has': '0' });
-  ui.edNoPhoto = textKey('editnophoto', 'REMOVE', '削除', 'Take the photo out of this theme');
+  ui.edNoPhoto = textKey('editnophoto', 'REMOVE', '削除', 'Take the picture out of this theme');
   body.appendChild(h('div', { class: 'mpe-photo' }, ui.edThumb,
     h('div', { class: 'mpe-photo-keys' },
-      textKey('editphoto', 'CHOOSE PHOTO', '選択', 'Put a picture from this computer behind the player', I.plus), ui.edNoPhoto)));
+      textKey('editphoto', 'CHOOSE FILE', '選択', 'Put a photo, a moving GIF or a short video from this computer behind the player', I.plus), ui.edNoPhoto)));
+  body.appendChild(h('div', { class: 'mp-hint mpe-hint', text: 'A photo, a moving GIF, or a short video (MP4 or WebM, played without its sound).' }));
   ui.edOpts = h('div', { class: 'mpe-opts', hidden: true });
   var fits = h('div', { class: 'mpe-fits', role: 'group', 'aria-label': 'How the photo fills the player' });
   FITS.forEach(function (f) {
@@ -5300,7 +6085,7 @@ function buildEditor() {
   body.appendChild(ui.edOpts);
   ui.edMsg = h('div', { class: 'mp-user-msg mpe-msg', hidden: true, role: 'status' });
   body.appendChild(ui.edMsg);
-  ui.edFile = h('input', { type: 'file', accept: 'image/*', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
+  ui.edFile = h('input', { type: 'file', accept: 'image/*,video/mp4,video/webm,video/quicktime,.gif,.webp,.apng,.mp4,.m4v,.webm,.mov', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
   ui.edFile.addEventListener('change', function () {
     if (ui.edFile.files && ui.edFile.files[0]) editPhotoPicked(ui.edFile.files[0]);
   });
@@ -5340,6 +6125,16 @@ function syncPanel() {
   var opts = ui.panelWrap.querySelectorAll('[data-opt]');
   for (i = 0; i < opts.length; i++)
     opts[i].setAttribute('aria-checked', S[opts[i].getAttribute('data-opt')] ? 'true' : 'false');
+  if (ui.popRow) {
+    ui.popRow.hidden = !S.popup;
+    var pops = ui.popRow.querySelectorAll('[data-pop]');
+    for (i = 0; i < pops.length; i++) pops[i].setAttribute('aria-pressed', pops[i].getAttribute('data-pop') === S.popupPos ? 'true' : 'false');
+    ui.dcRow.hidden = !S.discord;
+    var say = npDiscordText();
+    ui.dcState.textContent = say;
+    ui.dcState.hidden = !say;
+    ui.dcState.setAttribute('data-kind', NP.dc === 'on' && npId() ? 'ok' : 'warn');
+  }
 }
 
 function openPanel() {
@@ -5500,7 +6295,11 @@ function onKey(e) {
       return;
     }
   }
-  if (S.mode === 'apple' || S.panelOpen) return;
+  if (S.mode === 'apple' || S.panelOpen) {
+    // (what is typed into the settings panel's own box stays there)
+    if (S.panelOpen && typing && ui.panelWrap && ui.panelWrap.contains(t)) e.stopPropagation();
+    return;
+  }
 
   // search shortcuts (full face)
   if (S.mode === 'full' && !typing &&
@@ -5615,6 +6414,7 @@ whenBody(function () {
   notifyHost();
   send('compact|0');
   send('ontop|' + (S.onTop ? 1 : 0));
+  send('hello|2');                     // (the app answers with what it can do: see "Now playing, for the app")
   dlog('skin started, ' + innerWidth + 'x' + innerHeight + ', theme ' + S.theme);
 
   // Apple's player never came up (no network when the app started, say):
@@ -5662,5 +6462,6 @@ window.__mp = {
   setPanel: setPanel, setEffect: vzSet, setVizBig: setVizBig, vizRetry: vzRetry, setOnTop: setOnTop,
   parseTtml: parseTtml, fetchLyrics: lyFetch, showLyrics: lyShow, songIdsFrom: songIdsFrom,
   user: USER, userThemes: { edit: editOpen, save: editSave, cancel: editCancel, photo: editPhotoPicked, noPhoto: editNoPhoto,
-    file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor }
+    font: editFontPicked, noFont: editNoFont, file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor },
+  cover: COVER, coverPalette: coverPalette, nowPlaying: NP, hostMessage: onHostMessage
 };
