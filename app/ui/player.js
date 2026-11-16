@@ -1480,6 +1480,7 @@ function authorized() {
 function call(name) {
   var m = S.music;
   if (!m || typeof m[name] !== 'function') return;
+  if (name === 'play' || name === 'skipToNextItem' || name === 'skipToPreviousItem' || name === 'changeToMediaAtIndex') RC.wantAt = performance.now();
   try {
     var r = m[name].apply(m, Array.prototype.slice.call(arguments, 1));
     if (r && typeof r.catch === 'function') r.catch(function () {});
@@ -1547,6 +1548,7 @@ function bindMusic(m) {
   on('nowPlayingItemDidChange', onItem);
   on('playbackTimeDidChange', refreshTime);
   on('playbackTimeDidChange', clockSample);   // measure the precise clock at every tick, lyrics on screen or not
+  on('playbackTimeDidChange', rcTick);        // and keep the note of where the music is (see "Coming back from a playback failure")
   on('playbackDurationDidChange', refreshTime);
   on('queueItemsDidChange', onQueue);
   on('queuePositionDidChange', function () { refreshItem(); });
@@ -1559,10 +1561,12 @@ function bindMusic(m) {
   onState();
   refreshAll();
   onAuthChange();
+  rcBoot();
 }
 
 function onQueue() {
   S.queueChangedAt = performance.now();
+  rcQueue();
   clearTimeout(onQueue.t);
   onQueue.t = setTimeout(renderQueue, 80);
 }
@@ -1595,14 +1599,361 @@ function onState() {
   refreshState();
 }
 
-// Apple shows playback failures in a dialog on its own page, which is not
-// drawn in our faces - so say it here.
-function onPlaybackError(e) {
-  var what = errText(e);
-  var hint = /LICENSE/i.test(what) ? ' - closing and reopening the app usually clears this' : '';
-  dlog('playback error: ' + what);
-  notice('PLAYBACK ERROR: ' + what + hint);
+// ============================================================================
+// Coming back from a playback failure
+//
+// Full songs are copy-protected. In the Windows app their keys are held by
+// Windows' own PlayReady, outside the page. Now and then, after an hour or
+// two of music (and more often with a game running), Apple's player reports
+// "MEDIA_KEY ... The session is already closed" or a plain "Playback Error",
+// or sits at "loading" - and then nothing plays again until the app is closed
+// and opened. What the log shows fits the keys being taken back underneath
+// the player (the engine closes every key session when the graphics device
+// is reset), with the player carrying on with sessions that are gone. That
+// is not proven: rcSysClosed and the "media error" line below are there to
+// show it the next time.
+//
+// Closing and opening the app has cured it every time. The nearest thing the
+// skin can do by itself is a fresh page, so it does that (whether a fresh
+// page is always enough has not been seen yet either; the log will say).
+// While music plays it keeps a note of what is queued, which song, and how
+// far into it. After a failure:
+//   1. a moment's wait: the player may have carried on by itself
+//   2. the same queue is handed to the player again, at the same spot
+//   3. if that fails too, or Windows was seen taking the keys away: the page
+//      is loaded again (Windows app) and carries on from the note, left in
+//      sessionStorage for the new page
+// At most one of each in a row; after that the message stays up and it is the
+// listener's turn. Failures that trying again cannot change (another device
+// is playing, the subscription, a song that is not available) are only
+// reported, and so is one that arrives while nothing was playing.
+// ============================================================================
+var RC = {
+  ids: [],                        // the queue as song ids ('' where it holds something else), kept from the last time it was not empty
+  id: '', pos: -1, t: 0,          // the song last heard playing, where in the queue, and how far in (seconds)
+  at: -1e9,                       // when that was (performance.now())
+  wantAt: -1e9,                   // when the listener last asked for music
+  busyAt: 0,                      // since when the player has been "loading" with nothing playing
+  healthyAt: 0,                   // since when music has been playing without trouble
+  streak: false,                  // a try is on record (see rcStreak)
+  sysClosedAt: 0, sysClosedWhy: '',   // Windows closed a key session by itself
+  asked: [],                      // the last few times the player asked Apple for a song or for its key (for the log)
+  working: 0,                     // a try is under way (its number)
+  timer: 0,
+  note: null,                     // left by the page before this one: carry on with it (see rcBoot)
+  reload: function () { location.reload(); }
+};
+var RC_SONG = /^(i\.[\w-]+|\d{3,})$/;
+
+// What has been tried since music last played well: { n: tries, hard: the
+// page was loaded again, at }. Kept in sessionStorage so that it is still
+// known after such a reload; forgotten after ten minutes, or 90 seconds of
+// music.
+function rcStreak() {
+  var s = null;
+  try { s = JSON.parse(sessionStorage.getItem('mp.rc') || 'null'); } catch (e) {}
+  if (!s || typeof s.at !== 'number' || !(Date.now() - s.at < 600000)) s = { n: 0, hard: false, at: 0 };
+  return s;
 }
+function rcStreakSet(s) {
+  RC.streak = !!s;
+  RC.healthyAt = 0;
+  try { if (s) sessionStorage.setItem('mp.rc', JSON.stringify(s)); else sessionStorage.removeItem('mp.rc'); } catch (e) {}
+}
+
+function rcSongId(it) {
+  var id = '', type = '';
+  try { id = String(it.id || ''); type = String(it.type || ''); } catch (e) {}
+  if (type && !/song/i.test(type)) return '';      // a music video, a radio station: not something a list of songs can hold
+  return RC_SONG.test(id) ? id : '';
+}
+function rcIds(items) {
+  var ids = [];
+  for (var i = 0; i < items.length; i++) ids.push(rcSongId(items[i]));
+  return ids;
+}
+// the queue changed (not written down while it is empty: a failure may be what emptied it)
+function rcQueue() {
+  var items = queueItems();
+  if (items.length) RC.ids = rcIds(items);
+}
+// music is playing: where it is
+function rcTick() {
+  var m = S.music, it = nowItem(), t = 0;
+  if (!m || !it || stateName() !== 'playing') return;
+  try { t = m.currentPlaybackTime || 0; } catch (e) {}
+  if (!(t > 0)) return;
+  RC.id = String(it.id || '');
+  RC.pos = curIndex();
+  RC.t = t;
+  RC.at = performance.now();
+  RC.busyAt = 0;
+  if (!RC.streak) return;
+  if (!RC.healthyAt) RC.healthyAt = RC.at;
+  else if (RC.at - RC.healthyAt > 90000) rcStreakSet(null);     // all is well again: the next failure is a new one
+}
+// Was music playing, or being asked for, just now?
+function rcWanted() {
+  var last = Math.max(RC.at, RC.wantAt);
+  return last > S.haltAt && performance.now() - last < 60000;
+}
+
+// What to carry on with: a stretch of the queue around the song concerned
+// (some songs back, QUEUE_CHUNK onwards), which of them it is, and how far in.
+// null: nothing that can be handed back (an empty queue, a radio station).
+function rcNote() {
+  var m = S.music, items = queueItems(), ids = items.length ? rcIds(items) : RC.ids, pos = items.length ? curIndex() : RC.pos, t = 0, i;
+  if (!(pos >= 0 && pos < ids.length)) pos = RC.id ? ids.indexOf(RC.id) : -1;     // (the player has lost its place)
+  if (pos < 0 || !ids[pos]) return null;
+  if (ids[pos] === RC.id) {
+    t = RC.t;
+    try { if (String(nowItem().id) === RC.id && m.currentPlaybackTime > t) t = m.currentPlaybackTime; } catch (e) {}
+  }
+  var list = [], at = -1;
+  for (i = Math.max(0, pos - 30); i < ids.length && list.length < QUEUE_CHUNK + 30; i++) {
+    if (!ids[i]) continue;
+    if (i === pos) at = list.length;
+    list.push(ids[i]);
+  }
+  var note = { ids: list, pos: at, id: ids[pos], t: Math.floor(t), shuffle: shuffleOn(), repeat: null };
+  try { if (typeof m.repeatMode === 'number') note.repeat = m.repeatMode; } catch (e) {}
+  return note;
+}
+
+// One line of circumstances for the log, to go with a failure.
+function rcDetail(code) {
+  var s = [], t = 0, now = performance.now(), i;
+  try { t = S.music.currentPlaybackTime || 0; } catch (e) {}
+  s.push('code ' + (code || '-'), 'state ' + stateName(), Math.round(t) + ' s in', 'song ' + (RC.id || '-'),
+    RC.at > 0 ? 'last heard ' + Math.round((now - RC.at) / 1000) + ' s ago' : 'nothing heard yet',
+    S.seen ? 'window in sight' : 'window out of sight', navigator.onLine ? 'online' : 'OFFLINE');
+  if (RC.sysClosedAt) s.push('the system closed a key session ' + Math.round((now - RC.sysClosedAt) / 1000) + ' s ago (' + RC.sysClosedWhy + ')');
+  try {
+    var els = document.querySelectorAll('audio, video');
+    for (i = 0; i < els.length; i++) {
+      if (els[i].error) s.push(els[i].tagName.toLowerCase() + ' error ' + els[i].error.code + ' ' + String(els[i].error.message || '').slice(0, 110));
+    }
+  } catch (e) {}
+  return s.join(', ');
+}
+function rcHint() {
+  return HOST_KIND === 'windows' ? ' - CLOSE THE APP AND OPEN IT AGAIN' : ' - CLOSE THE PLAYER AND OPEN IT AGAIN';
+}
+// And a second line: when the player last asked Apple for a song and for a
+// key (a key is asked for again every so often while a song plays). Only
+// looked at, through the browser's own list of requests - nothing is changed.
+function rcAsked() {
+  var now = performance.now();
+  return 'asked Apple for: ' + RC.asked.map(function (a) {
+    return a.what + ' ' + Math.round((now - a.at) / 1000) + ' s ago' + (a.status ? ' (' + a.status + ')' : '') + (a.took > 3000 ? ' took ' + Math.round(a.took / 1000) + ' s' : '');
+  }).join(', ');
+}
+try {
+  new PerformanceObserver(function (list) {
+    list.getEntries().forEach(function (e) {
+      var hit = /\/(webPlayback|acquireWebPlaybackLicense)(\?|$)/.exec(String(e.name || ''));
+      if (!hit) return;
+      RC.asked.push({ what: hit[1] === 'webPlayback' ? 'song' : 'key', at: e.startTime, took: Math.round(e.duration), status: e.responseStatus || 0 });
+      if (RC.asked.length > 6) RC.asked.shift();
+    });
+  }).observe({ type: 'resource', buffered: true });
+} catch (e) {}
+
+// Apple shows playback failures in a dialog on its own page, which is not
+// drawn in our faces - so say it here, and try to get the music back.
+function onPlaybackError(e) {
+  var what = errText(e), code = '';
+  try { code = String((e && (e.errorCode || e.name)) || ''); } catch (x) {}
+  var all = code + ' ' + what;
+  dlog('playback error: ' + what);
+  dlog('  ' + rcDetail(code));
+  if (RC.asked.length) dlog('  ' + rcAsked());
+  if (RC.working < 0) return;                             // the page is about to be loaded again as it is
+  if (RC.working) { rcNext(what, true); return; }          // the try that was under way has failed
+  notice('PLAYBACK ERROR: ' + what);
+  if (!rcWanted() || !navigator.onLine ||
+      /More than one device|DEVICE_LIMIT|STREAM_UPSELL|SUBSCRIPTION|AUTHORIZATION|UNAUTHORIZED|TOKEN_EXPIRED|CONTENT_(UNAVAILABLE|RESTRICTED|UNSUPPORTED|EQUIVALENT)|AGE_VERIFICATION|GEO_BLOCK|USER_INTERACTION|NOT_FOUND/i.test(all)) return;
+  // Windows took the keys away, and the player has just tripped over that:
+  // only a fresh page gets it going again
+  var fresh = /MEDIA_KEY|MEDIA_LICENSE|MEDIA_SESSION|MEDIA_CERTIFICATE|LICENSE|PLAYREADY|MediaKey/i.test(all) &&
+    RC.sysClosedAt > 0 && performance.now() - RC.sysClosedAt < 900000;
+  clearTimeout(RC.timer);
+  RC.timer = setTimeout(function () { rcAfterError(what, fresh, 0); }, 2000);
+}
+
+// A little after a failure: has the player carried on by itself (it skips a
+// song it cannot play), is it still at it, or has it given up?
+function rcAfterError(what, fresh, n) {
+  var name = stateName();
+  if (name === 'playing' && performance.now() - RC.at < 1200) return;              // music: nothing to do
+  var busy = name === 'playing' || name === 'loading' || name === 'waiting' || name === 'stalled' || name === 'seeking';
+  if (busy && n < 7) { RC.timer = setTimeout(function () { rcAfterError(what, fresh, n + 1); }, 1000); return; }   // a few seconds more
+  rcNext(what, fresh);
+}
+
+// The next thing to try, if there is one left.
+function rcNext(what, fresh) {
+  var s = rcStreak(), note = rcWanted() ? rcNote() : null;
+  var soft = s.n === 0 && !(fresh && HOST_KIND === 'windows');
+  var hard = HOST_KIND === 'windows' && !s.hard && !USER.draft;      // (not from under an open theme editor: what is in it would be lost)
+  clearTimeout(RC.timer);
+  RC.working = 0;
+  if (!note) return false;                                           // nothing that can be handed back: the message is all
+  if (!soft && !hard) {
+    dlog('recover: tried what there is to try, leaving it');
+    notice('PLAYBACK ERROR: ' + what + rcHint());
+    return false;
+  }
+  s.n++;
+  s.at = Date.now();
+  if (soft) {
+    rcStreakSet(s);
+    dlog('recover: handing the queue to the player again (' + note.ids.length + ' songs, number ' + (note.pos + 1) + ', ' + note.t + ' s in)');
+    notice('PLAYBACK STOPPED - STARTING IT AGAIN');
+    rcStart(note, false, what);
+    return true;
+  }
+  s.hard = true;
+  note.at = Date.now();
+  note.mode = S.mode === 'compact' ? 'compact' : 'full';
+  note.auth = authorized();
+  note.why = String(what).slice(0, 120);
+  if (B.view && /^(recent|songs|albums|artists|playlist|album|artist)$/.test(B.view.kind)) note.view = B.view;
+  try { sessionStorage.setItem('mp.resume', JSON.stringify(note)); }
+  catch (e) { notice('PLAYBACK ERROR: ' + what + rcHint()); return false; }
+  rcStreakSet(s);
+  dlog('recover: loading the page again to carry on (' + note.ids.length + ' songs, number ' + (note.pos + 1) + ', ' + note.t + ' s in)');
+  notice('PLAYBACK STOPPED - STARTING THE PLAYER AGAIN, ONE MOMENT');
+  RC.working = -1;
+  setTimeout(function () { RC.reload(); }, 600);
+  return true;
+}
+
+// Hand the note's songs to the player and see that music comes of it.
+// back: on a page that was loaded again for this.
+function rcStart(note, back, what) {
+  var m = S.music, mk = MK(), run = RC.working = (rcStart.n = (rcStart.n || 0) + 1), n = 0, since = performance.now();
+  if (!m) { RC.working = 0; return; }
+  if (back) {
+    // (a fresh page starts with the player's own settings for these)
+    try { if (typeof note.repeat === 'number') m.repeatMode = note.repeat; } catch (e) {}
+    try { if (mk && mk.PlayerShuffleMode) m.shuffleMode = note.shuffle ? mk.PlayerShuffleMode.songs : mk.PlayerShuffleMode.off; } catch (e) {}
+    refreshModes();
+  }
+  startQueue({ songs: note.ids, startWith: note.pos });
+  var tok = S.startTok, started = 0;
+  S.starting.then(function () { started = performance.now(); });
+  (function look() {
+    if (RC.working !== run) return;                                          // failed meanwhile: dealt with elsewhere
+    if (S.startTok !== tok || S.haltAt > since) { RC.working = 0; return; }  // the listener has done something else
+    var it = nowItem(), t = 0;
+    try { t = m.currentPlaybackTime || 0; } catch (e) {}
+    // (music heard after the queue was handed over: not what was left of the old one)
+    if (started && stateName() === 'playing' && it && RC.at > started) {
+      RC.working = 0;
+      if (String(it.id) === note.id && note.t > 5 && t < note.t - 3) call('seekToTime', note.t);
+      dlog('recover: playing again' + (String(it.id) === note.id ? '' : ' (another song: ' + it.id + ')'));
+      notice(back ? 'THE PLAYER WAS STARTED AGAIN - CARRYING ON' : 'PLAYING AGAIN', true);
+      return;
+    }
+    if (++n < (back ? 120 : 60)) { setTimeout(look, 250); return; }
+    dlog('recover: nothing playing after ' + Math.round(n / 4) + ' s, state ' + stateName());
+    rcNext(what || 'Playback did not start', true);
+  })();
+}
+
+// A page that was loaded again to get the music back: carry on once Apple's
+// player is there (and signed in, if it was).
+function rcBoot() {
+  var note = RC.note, n = 0;
+  if (!note) return;
+  RC.note = null;
+  RC.working = -1;
+  (function ready() {
+    if (!S.music) { RC.working = 0; return; }
+    if (note.auth && !authorized()) {
+      if (++n < 80) { setTimeout(ready, 250); return; }
+      RC.working = 0;
+      dlog('recover: not signed in on the new page, leaving it');
+      notice('PLAYBACK ERROR: ' + (note.why || 'Playback Error') + rcHint());
+      return;
+    }
+    RC.wantAt = performance.now();
+    dlog('recover: page loaded again, carrying on');
+    rcStart(note, true, note.why);
+  })();
+}
+
+// "Loading" for 20 seconds with nothing playing is the same failure without
+// a message. (Checked once a second.)
+function rcWatch() {
+  var name = stateName(), now = performance.now();
+  if (RC.working || !navigator.onLine || !(name === 'loading' || name === 'waiting' || name === 'stalled' || name === 'seeking')) { RC.busyAt = 0; return; }
+  if (!RC.busyAt) { RC.busyAt = now; return; }
+  if (now - RC.busyAt < 20000) return;
+  RC.busyAt = 0;
+  if (!rcWanted() || !rcNote()) return;
+  dlog('playback: still ' + name + ' after 20 s');
+  dlog('  ' + rcDetail('stuck'));
+  if (RC.asked.length) dlog('  ' + rcAsked());
+  rcNext('Nothing would play', true);
+}
+
+// Key sessions: note when one is closed that the page did not close itself.
+function rcSysClosed(why) {
+  RC.sysClosedAt = performance.now();
+  RC.sysClosedWhy = String(why || 'no reason given').slice(0, 40);
+  dlog('copy protection: the system closed a key session (' + RC.sysClosedWhy + '), state ' + stateName());
+}
+(function () {
+  try {
+    var P = window.MediaKeySession && window.MediaKeySession.prototype;
+    if (!P || typeof P.generateRequest !== 'function' || typeof P.close !== 'function') return;
+    var gen = P.generateRequest, shut = P.close, seen = new WeakSet(), ours = new WeakSet();
+    P.generateRequest = function () {
+      var s = this;
+      try {
+        if (!seen.has(s)) {
+          seen.add(s);
+          s.closed.then(function (why) { if (!ours.has(s)) rcSysClosed(why); }, function () {});
+        }
+      } catch (e) {}
+      return gen.apply(this, arguments);
+    };
+    P.close = function () {
+      try { ours.add(this); } catch (e) {}
+      return shut.apply(this, arguments);
+    };
+  } catch (e) {}
+})();
+// what the audio element itself says went wrong (the engine's own words)
+document.addEventListener('error', function (e) {
+  var el = e.target, err = null;
+  try { err = el && (el.tagName === 'AUDIO' || el.tagName === 'VIDEO') && !(el.classList && el.classList.contains('mp-bgv')) && el.error; } catch (x) {}
+  if (err) dlog('media error ' + err.code + ': ' + String(err.message || '').slice(0, 220));
+}, true);
+
+// the note left by the page before this one, if this is such a reload
+(function () {
+  var n = null, i;
+  try {
+    n = JSON.parse(sessionStorage.getItem('mp.resume') || 'null');
+    sessionStorage.removeItem('mp.resume');
+    RC.streak = !!sessionStorage.getItem('mp.rc');
+  } catch (e) {}
+  if (!n || typeof n !== 'object' || !Array.isArray(n.ids) || !n.ids.length || n.ids.length > QUEUE_CHUNK + 30) return;
+  if (!(Date.now() - n.at < 120000) || !(n.pos >= 0 && n.pos < n.ids.length) || n.pos !== Math.floor(n.pos)) return;
+  for (i = 0; i < n.ids.length; i++) if (typeof n.ids[i] !== 'string' || !RC_SONG.test(n.ids[i])) return;
+  n.id = n.ids[n.pos];
+  n.t = n.t > 0 && n.t < 86400 ? Math.floor(n.t) : 0;
+  n.shuffle = !!n.shuffle;
+  n.auth = !!n.auth;
+  n.why = typeof n.why === 'string' ? n.why.slice(0, 120) : '';
+  var v = n.view;
+  n.view = (v && typeof v === 'object' && /^(recent|songs|albums|artists|playlist|album|artist)$/.test(v.kind)) ? v : null;
+  RC.note = n;
+  if (n.mode === 'compact') S.mode = 'compact';      // (and the app's window still has that shape)
+})();
 
 // A temporary message: on the browser's notice line and on the song line.
 // good: news rather than trouble (shown for a shorter time, without the "!").
@@ -4288,6 +4639,7 @@ function playForSure(m, since) {
 
 function startNow(m, mk, opts, shuffle) {
   var PM = mk && mk.PlayerShuffleMode, resume = false, settled = false, since = performance.now();
+  RC.wantAt = since;
   dlog('start: ' + Object.keys(opts).map(function (k) { return k === 'songs' ? 'songs x' + opts.songs.length : k; }).join(' ') + ', state ' + stateName());
   try {
     if (PM && shuffle !== undefined) m.shuffleMode = shuffle ? PM.songs : PM.off;
@@ -6406,13 +6758,14 @@ whenBody(function () {
   buildUi();
   placeControls();
   renderNavPlaylists();
-  B.view = { kind: 'recent' };
+  // (a page loaded again to get the music back shows what the one before it showed)
+  B.view = (RC.note && RC.note.view) || { kind: 'recent' };
   renderView();
   refreshAll();
   hookMusic();
 
   notifyHost();
-  send('compact|0');
+  if (S.mode === 'compact') requestCompactSize(); else send('compact|0');
   send('ontop|' + (S.onTop ? 1 : 0));
   send('hello|2');                     // (the app answers with what it can do: see "Now playing, for the app")
   dlog('skin started, ' + innerWidth + 'x' + innerHeight + ', theme ' + S.theme);
@@ -6451,6 +6804,7 @@ whenBody(function () {
     applyTheme();
     floatCheck();
     keepAttached();
+    rcWatch();
     if (deckShown()) { refreshState(); refreshTime(); vzKick(); lyRefresh(); lyKick(); }
   }, 1000);
 });
@@ -6463,5 +6817,6 @@ window.__mp = {
   parseTtml: parseTtml, fetchLyrics: lyFetch, showLyrics: lyShow, songIdsFrom: songIdsFrom,
   user: USER, userThemes: { edit: editOpen, save: editSave, cancel: editCancel, photo: editPhotoPicked, noPhoto: editNoPhoto,
     font: editFontPicked, noFont: editNoFont, file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor },
-  cover: COVER, coverPalette: coverPalette, nowPlaying: NP, hostMessage: onHostMessage
+  cover: COVER, coverPalette: coverPalette, nowPlaying: NP, hostMessage: onHostMessage,
+  recover: RC, playbackError: onPlaybackError, recoverNote: rcNote, recoverWatch: rcWatch, recoverStreak: rcStreak, recoverAsked: rcAsked
 };
