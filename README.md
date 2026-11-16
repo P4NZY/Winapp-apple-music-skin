@@ -15,6 +15,7 @@ Looking for Spotify and SoundCloud? The same player for those is [Stream Player]
 - **Queue panel.** With shuffle on, the song you click plays first and the rest is shuffled after it.
 - **Your own playlist order:** drag playlists, or use Alt+↑ / Alt+↓. RESET goes back to Apple's order.
 - **18 colour themes**, including Hatsune Miku, Kasane Teto and Ado.
+- **Themes of your own:** pick every colour and put a photo behind the player (fill, fit, stretch or tile it; size, position, tint, blur, and how see-through the displays are). EXPORT saves a theme as one `.mpskin` file, photo included, and IMPORT opens it on your other computer, Windows or Mac.
 - **Compact player** (Ctrl+M) that can stay above everything: on Windows including fullscreen browsers and games in windowed fullscreen, on a Mac in a small window of its own that floats above every app.
 
 ## Run it on Windows
@@ -71,6 +72,8 @@ The installer makes a **Music Player** app in your Applications folder: it opens
 ## How it works
 
 `MusicPlayer.exe` hosts music.apple.com in WebView2 and injects the skin. Apple's page keeps running underneath: its MusicKit loads your library and plays the music, while the skin draws the interface and tells it what to do. Songs are copy-protected and decoded outside the page, so the page can't hear them; the app captures its own sound output instead and passes it to the visualizer and the level meter.
+
+A theme of your own is kept in the page's storage (the photos in IndexedDB). A `.mpskin` file is plain JSON: the name, the six colours, and the photo with its settings, the way a Winamp `.wsz` carries its pictures and colour files in one piece. Whatever is read from such a file is checked first: colours must be `#rrggbb`, numbers are kept in range, and the photo must decode as a picture.
 
 On a Mac, a browser extension injects the same skin into music.apple.com, in an app window with a browser profile of its own. To let the visualizer hear the music, the extension captures the tab's sound (`chrome.tabCapture`). The browser is started with `--allowlisted-extension-id`, so no toolbar click is needed. The floating compact player is a Document Picture-in-Picture window.
 

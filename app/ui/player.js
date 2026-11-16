@@ -221,8 +221,15 @@ var S = {
 var ui = {};
 var sheet = null;
 
+// Themes of your own (see "Themes of your own" below): the saved ones, their
+// photos once read from storage, and the one being edited.
+var USER = { list: [], photos: {}, dbP: null, draft: null, draftPhotoWas: '', armTimer: 0, msgTimer: 0 };
+
 function themeNow() {
-  for (var i = 0; i < THEMES.length; i++) if (THEMES[i].id === S.theme) return THEMES[i];
+  var i;
+  if (USER.draft) return USER.draft;                   // the editor is open: what it shows is the theme
+  for (i = 0; i < THEMES.length; i++) if (THEMES[i].id === S.theme) return THEMES[i];
+  for (i = 0; i < USER.list.length; i++) if (USER.list[i].id === S.theme) return USER.list[i];
   return THEMES[0];
 }
 function deckShown() { return S.mode !== 'apple'; }
@@ -257,8 +264,16 @@ function installCss() {
   }
 }
 
+// A built-in theme is a rule in the style sheet (themeCss). A theme of your
+// own has none: its colours are set on the element itself, which is also what
+// lets the editor show every change the moment it is made.
+var OWN_VARS = ['--mp-shell-a', '--mp-shell-b', '--mp-shell-text', '--mp-lit', '--mp-lcd-bg', '--mp-lcd-bg-rgb', '--mp-lcd-fg', '--mp-lcd-fg-rgb'];
+function ownVars(t) {
+  return [t.shellA, t.shellB, t.shellText, t.lit, t.lcdBg, hexToRgb(t.lcdBg).join(','), t.lcdFg, hexToRgb(t.lcdFg).join(',')];
+}
+
 function applyTheme() {
-  var t = themeNow(), pin = floatOk() ? '1' : '0';
+  var t = themeNow(), pin = floatOk() ? '1' : '0', own = t.user ? ownVars(t) : null, sig = own ? own.join('|') : '';
   // the page's <html>, and the floating compact player's (Mac) when it is open
   [document.documentElement, FLOAT.win && FLOAT.win.document.documentElement].forEach(function (root) {
     if (!root) return;
@@ -266,10 +281,15 @@ function applyTheme() {
     if (root.getAttribute('data-mp-mode') !== S.mode) root.setAttribute('data-mp-mode', S.mode);
     if (root.getAttribute('data-mp-host') !== HOST_KIND) root.setAttribute('data-mp-host', HOST_KIND);
     if (root.getAttribute('data-mp-pin') !== pin) root.setAttribute('data-mp-pin', pin);
+    if (root.__mpOwn !== sig || (sig && !root.style.getPropertyValue('--mp-shell-a'))) {
+      OWN_VARS.forEach(function (name, i) { if (own) root.style.setProperty(name, own[i]); else root.style.removeProperty(name); });
+      root.__mpOwn = sig;
+    }
   });
   // the page shows a plate saying where the player went while it floats
   var root = document.documentElement, fl = FLOAT.win || FLOAT.opening ? '1' : '0';
   if (root && root.getAttribute('data-mp-float') !== fl) root.setAttribute('data-mp-float', fl);
+  applyPhoto(t);
 }
 
 // Tell the app window how to paint its title bar. The displays are dark in
@@ -287,12 +307,529 @@ function notifyHost() {
 function setTheme(id) {
   S.theme = id;
   store.set('theme', id);
+  if (!userTheme(id)) store.set('themeBase', id);      // the built-in one to fall back on if a theme of your own is deleted
+  retheme();
+  syncPanel();
+}
+
+// The look changed: repaint everything that takes its colours from the theme.
+function retheme() {
   applyTheme();
   notifyHost();
-  syncPanel();
   vizColors();
   vzColors();
   kickViz();
+}
+
+// ============================================================================
+// Themes of your own
+// The same six colours as a built-in theme, a name, and optionally a photo
+// behind the player with how it is laid out (fit, size, place, how much of the
+// body colour lies over it, blur, how see-through the displays are).
+//
+//   the list      the page's storage, mp.userThemes (small: colours, settings
+//                 and a thumbnail of the photo)
+//   the photos    a little database of their own, IndexedDB "mp-skins" (they
+//                 are too big for the other storage)
+//   on the move   one .mpskin file per theme: plain JSON with the photo inside
+//                 it - the way a Winamp .wsz carries its pictures and colour
+//                 files in one piece. Made on Windows it opens on the Mac
+//                 version, and the other way round.
+//
+// Everything read from storage or from a file goes through cleanTheme /
+// cleanPhoto first: colours must be #rrggbb, numbers are kept within range,
+// and a photo must really decode as a picture. Nothing from a file is ever
+// used as markup or as a style rule.
+// ============================================================================
+var COLOURS = [
+  ['shellA', 'Body, top'], ['shellB', 'Body, bottom'], ['shellText', 'Lettering'],
+  ['lit', 'Lamps and lit keys'], ['lcdBg', 'Displays'], ['lcdFg', 'Display ink']
+];
+var HEX = /^#[0-9a-f]{6}$/i;
+var FITS = [['cover', 'FILL'], ['contain', 'FIT'], ['stretch', 'STRETCH'], ['tile', 'TILE']];
+// the photo's sliders: key, label, from, to, step, unit, where it starts
+var PHOTO_KNOBS = [
+  ['size', 'Size', 40, 300, 5, '%', 100],
+  ['x', 'Left - right', 0, 100, 1, '%', 50],
+  ['y', 'Up - down', 0, 100, 1, '%', 50],
+  ['tint', 'Body colour over it', 0, 95, 1, '%', 35],
+  ['blur', 'Blur', 0, 24, 1, 'px', 0],
+  ['glass', 'See-through displays', 0, 90, 1, '%', 25]
+];
+var SKIN_FORMAT = 'music-player-skin';
+var PHOTO_MAX = 2560;             // longest side kept, in pixels (a large screen's worth)
+
+function newId(prefix) {
+  var s = '', i;
+  for (i = 0; i < 10; i++) s += 'abcdefghijklmnopqrstuvwxyz0123456789'.charAt(Math.floor(Math.random() * 36));
+  return prefix + s;
+}
+function limit(v, lo, hi, d) { v = +v; return isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; }
+function cleanName(s) {
+  s = String(s === undefined || s === null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return s || 'My theme';
+}
+function cleanPhoto(p, key) {
+  var out = { key: key, fit: 'cover', thumb: '' }, i, k;
+  for (i = 0; i < FITS.length; i++) if (FITS[i][0] === p.fit) out.fit = p.fit;
+  for (i = 0; i < PHOTO_KNOBS.length; i++) { k = PHOTO_KNOBS[i]; out[k[0]] = limit(p[k[0]], k[2], k[3], k[6]); }
+  if (typeof p.thumb === 'string' && p.thumb.length < 60000 && /^data:image\/(jpeg|webp|png);base64,[A-Za-z0-9+\/=]+$/.test(p.thumb)) out.thumb = p.thumb;
+  return out;
+}
+// A theme as stored, or as read from a file -> one this app can trust (or null).
+function cleanTheme(raw, keepId) {
+  if (!raw || typeof raw !== 'object') return null;
+  var t = { id: keepId && /^u-[a-z0-9]{6,16}$/.test(raw.id) ? raw.id : newId('u-'), name: cleanName(raw.name), jp: '', user: true }, i, k;
+  for (i = 0; i < COLOURS.length; i++) {
+    k = COLOURS[i][0];
+    if (typeof raw[k] !== 'string' || !HEX.test(raw[k])) return null;
+    t[k] = raw[k].toLowerCase();
+  }
+  if (raw.photo && typeof raw.photo === 'object' && /^p-[a-z0-9]{6,16}$/.test(raw.photo.key)) t.photo = cleanPhoto(raw.photo, raw.photo.key);
+  return t;
+}
+function userTheme(id) {
+  for (var i = 0; i < USER.list.length; i++) if (USER.list[i].id === id) return USER.list[i];
+  return null;
+}
+// "Sunset", then "Sunset 2", "Sunset 3"...
+function freeName(name) {
+  var n = 1, out = name;
+  while (USER.list.some(function (x) { return x.name === out; })) out = name.slice(0, 36) + ' ' + (++n);
+  return out;
+}
+function saveUserThemes() {
+  return store.set('userThemes', USER.list.map(function (t) {
+    var o = { id: t.id, name: t.name };
+    COLOURS.forEach(function (c) { o[c[0]] = t[c[0]]; });
+    if (t.photo) o.photo = t.photo;
+    return o;
+  }));
+}
+(function () {
+  var saved = store.get('userThemes', []), i, t;
+  if (!Array.isArray(saved)) return;
+  for (i = 0; i < saved.length && USER.list.length < 80; i++) { t = cleanTheme(saved[i], true); if (t) USER.list.push(t); }
+})();
+
+// ---- the photos: kept in IndexedDB, shown through a blob: address ----
+function skinDb() {
+  if (!USER.dbP) USER.dbP = new Promise(function (ok, no) {
+    var o;
+    try { o = indexedDB.open('mp-skins', 1); } catch (e) { no(e); return; }
+    o.onupgradeneeded = function () { o.result.createObjectStore('photos'); };
+    o.onsuccess = function () { ok(o.result); };
+    o.onerror = o.onblocked = function () { no(o.error || new Error('the photo storage is not available')); };
+  });
+  return USER.dbP;
+}
+function dbDo(mode, fn) {
+  return skinDb().then(function (db) {
+    return new Promise(function (ok, no) {
+      var tx = db.transaction('photos', mode), rq = fn(tx.objectStore('photos'));
+      tx.oncomplete = function () { ok(rq ? rq.result : undefined); };
+      tx.onerror = tx.onabort = function () { no(tx.error || new Error('the photo storage refused')); };
+    });
+  });
+}
+function photoPut(key, blob) { return dbDo('readwrite', function (s) { return s.put(blob, key); }); }
+function photoGet(key) { return dbDo('readonly', function (s) { return s.get(key); }); }
+function photoDel(key) { return dbDo('readwrite', function (s) { return s.delete(key); }); }
+
+// Read a theme's photo from storage (once); it shows as soon as it is there.
+function loadPhoto(key) {
+  if (USER.photos[key]) return;
+  USER.photos[key] = { url: '', blob: null, saved: true };
+  photoGet(key).then(function (blob) {
+    if (!blob) { dlog('theme photo ' + key + ' is not in the storage'); return; }
+    USER.photos[key] = { url: URL.createObjectURL(blob), blob: blob, saved: true };
+    applyTheme();
+  }, function (e) { dlog('theme photos cannot be read: ' + errText(e)); });
+}
+function dropPhoto(key) {
+  var rec = USER.photos[key];
+  if (rec && rec.url) { try { URL.revokeObjectURL(rec.url); } catch (e) {} }
+  delete USER.photos[key];
+  photoDel(key).then(null, function () {});
+}
+
+// The photo behind the player: a layer of #mp-app (player.css, "a photo
+// behind the player"), steered with these variables on the element itself -
+// so it goes along when the player moves to the Mac's floating window.
+var PHOTO_VARS = ['--mp-photo', '--mp-photo-x', '--mp-photo-y', '--mp-photo-k', '--mp-photo-tint', '--mp-photo-blur', '--mp-glass'];
+function applyPhoto(t) {
+  var app = ui.app;
+  if (!app) return;
+  var p = t.user ? t.photo : null, rec = p ? USER.photos[p.key] : null;
+  if (p && !rec) loadPhoto(p.key);                       // not read yet: it arrives in a moment
+  var on = !!(p && rec && rec.url);
+  var vals = on ? ['url("' + rec.url + '")', p.x + '%', p.y + '%', (p.size / 100).toFixed(2), p.tint + '%', p.blur + 'px', (1 - p.glass / 100).toFixed(2)] : null;
+  var sig = on ? p.fit + '|' + vals.join('|') : '';
+  if (app.__mpPhoto === sig) return;
+  app.__mpPhoto = sig;
+  PHOTO_VARS.forEach(function (name, i) { if (vals) app.style.setProperty(name, vals[i]); else app.style.removeProperty(name); });
+  if (on) app.setAttribute('data-photo', p.fit); else app.removeAttribute('data-photo');
+}
+
+// A picture file -> what a theme keeps: the picture no bigger than a large
+// screen needs (as WebP), and a tiny one for the list of themes. With `keep`
+// (a photo out of a skin file) the bytes are kept as they are when they are
+// already small enough, so nothing is lost on the way between computers.
+function readPhoto(file, keep) {
+  if (!file || (file.type && file.type.indexOf('image/') !== 0)) return Promise.reject(new Error('That file is not a picture'));
+  if (file.size > 60 * 1024 * 1024) return Promise.reject(new Error('That picture is too big (over 60 MB)'));
+  return createImageBitmap(file).then(function (bmp) {
+    var k = Math.min(1, PHOTO_MAX / Math.max(bmp.width, bmp.height));
+    var th = document.createElement('canvas'), tk = Math.max(180 / bmp.width, 72 / bmp.height);
+    th.width = 180; th.height = 72;
+    th.getContext('2d').drawImage(bmp, (180 - bmp.width * tk) / 2, (72 - bmp.height * tk) / 2, bmp.width * tk, bmp.height * tk);
+    var thumb = th.toDataURL('image/jpeg', 0.72);
+    if (keep && k === 1 && file.type === 'image/webp') { if (bmp.close) bmp.close(); return { blob: file, thumb: thumb }; }
+    var c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bmp.width * k));
+    c.height = Math.max(1, Math.round(bmp.height * k));
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    if (bmp.close) bmp.close();
+    return new Promise(function (ok, no) {
+      c.toBlob(function (blob) {
+        if (blob) ok({ blob: blob, thumb: thumb }); else no(new Error('That picture could not be prepared'));
+      }, 'image/webp', 0.9);
+    });
+  }, function () { throw new Error('That picture could not be read (try a JPEG or a PNG)'); });
+}
+
+// ---- a theme as a file ----
+function blobToBase64(blob) {
+  return new Promise(function (ok, no) {
+    var fr = new FileReader();
+    fr.onload = function () { var s = String(fr.result); ok(s.slice(s.indexOf(',') + 1)); };
+    fr.onerror = function () { no(fr.error || new Error('the photo could not be read')); };
+    fr.readAsDataURL(blob);
+  });
+}
+function photoBlob(key) {
+  var rec = USER.photos[key];
+  return rec && rec.blob ? Promise.resolve(rec.blob) : photoGet(key);
+}
+// The .mpskin file for a theme: its name, colours and photo in one piece.
+function skinFile(t) {
+  var out = { format: SKIN_FORMAT, version: 1, name: t.name, colors: {} }, ready = Promise.resolve();
+  COLOURS.forEach(function (c) { out.colors[c[0]] = t[c[0]]; });
+  if (t.photo) {
+    ready = photoBlob(t.photo.key).then(function (blob) {
+      if (!blob) return null;                              // (its photo is gone: the colours still travel)
+      return blobToBase64(blob).then(function (b64) {
+        var p = { type: blob.type || 'image/webp', fit: t.photo.fit };
+        PHOTO_KNOBS.forEach(function (k) { p[k[0]] = t.photo[k[0]]; });
+        p.data = b64;
+        out.photo = p;
+      });
+    });
+  }
+  return ready.then(function () { return new Blob([JSON.stringify(out)], { type: 'application/json' }); });
+}
+function fileNameFor(t) {
+  return (t.name.replace(/[\\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim() || 'My theme') + '.mpskin';
+}
+function download(blob, name) {
+  var doc = drawDoc(), url = URL.createObjectURL(blob), a = doc.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  doc.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+}
+// EXPORT: ask where to save (the window must be asked straight away, while
+// the click still counts), then write the file. Where the browser has no
+// "save as" of its own, it is an ordinary download.
+function exportTheme(id) {
+  var t = userTheme(id), w = drawWin(), name, pick = null;
+  if (!t) return;
+  name = fileNameFor(t);
+  if (w.showSaveFilePicker) {
+    try {
+      pick = w.showSaveFilePicker({ suggestedName: name, types: [{ description: 'Music Player skin', accept: { 'application/json': ['.mpskin'] } }] });
+    } catch (e) { pick = null; }
+  }
+  (pick ? pick.then(null, function (e) { if (e && e.name === 'AbortError') throw e; return null; }) : Promise.resolve(null)).then(function (fh) {
+    return skinFile(t).then(function (blob) {
+      if (!fh) { download(blob, name); return name + ' - IN YOUR DOWNLOADS FOLDER'; }
+      return fh.createWritable().then(function (wr) {
+        return wr.write(blob).then(function () { return wr.close(); });
+      }).then(function () { return fh.name; });
+    });
+  }).then(function (where) { userSay('EXPORTED: ' + where, true); }, function (e) {
+    if (!e || e.name !== 'AbortError') userSay('COULD NOT EXPORT: ' + errText(e), false);
+  });
+}
+// IMPORT: a .mpskin file -> a new theme in the list (it never replaces one).
+function importSkin(file) {
+  if (!file) return Promise.reject(new Error('No file was chosen'));
+  if (file.size > 40 * 1024 * 1024) return Promise.reject(new Error('That file is too big to be a skin'));
+  return file.text().then(function (txt) {
+    var d = null, raw, t, ph, blob, bin, bytes, i;
+    try { d = JSON.parse(txt); } catch (e) {}
+    if (!d || typeof d !== 'object' || d.format !== SKIN_FORMAT || !d.colors || typeof d.colors !== 'object')
+      throw new Error('That is not a Music Player skin file');
+    if (+d.version > 1) throw new Error('That skin was made with a newer Music Player - update this one first');
+    raw = { name: d.name };
+    COLOURS.forEach(function (c) { raw[c[0]] = d.colors[c[0]]; });
+    t = cleanTheme(raw, false);
+    if (!t) throw new Error('That skin file is damaged (its colours cannot be read)');
+    t.name = freeName(t.name);
+    ph = d.photo;
+    if (!ph || typeof ph !== 'object' || typeof ph.data !== 'string' || !/^image\/(webp|jpeg|png)$/.test(ph.type)) return addTheme(t, null, '');
+    try {
+      bin = atob(ph.data);
+      bytes = new Uint8Array(bin.length);
+      for (i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      blob = new Blob([bytes], { type: ph.type });
+    } catch (e) { return addTheme(t, null, 'ITS PHOTO COULD NOT BE READ'); }
+    // through the same door as a photo chosen here: it must really be a picture
+    return readPhoto(blob, true).then(function (r) {
+      t.photo = cleanPhoto(ph, newId('p-'));
+      t.photo.thumb = r.thumb;
+      return addTheme(t, r.blob, '');
+    }, function () { return addTheme(t, null, 'ITS PHOTO COULD NOT BE READ'); });
+  });
+}
+function addTheme(t, blob, trouble) {
+  var done = Promise.resolve(), key = t.photo ? t.photo.key : '';
+  if (key && blob) {
+    USER.photos[key] = { url: URL.createObjectURL(blob), blob: blob, saved: false };
+    done = photoPut(key, blob).then(function () { USER.photos[key].saved = true; },
+      function (e) { trouble = 'ITS PHOTO WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+  } else delete t.photo;
+  return done.then(function () {
+    USER.list.push(t);
+    if (!saveUserThemes()) trouble = 'IT COULD NOT BE KEPT: THE STORAGE IS FULL';
+    renderUserThemes();
+    setTheme(t.id);
+    return { theme: t, trouble: trouble };
+  });
+}
+function deleteTheme(id) {
+  var t = userTheme(id);
+  if (!t) return;
+  USER.list = USER.list.filter(function (x) { return x.id !== id; });
+  saveUserThemes();
+  if (t.photo) dropPhoto(t.photo.key);
+  renderUserThemes();
+  if (S.theme === id) setTheme(store.get('themeBase', 'midnight')); else syncPanel();
+}
+
+// ---- the editor: a drawer down the right-hand side; the player beside it
+//      is the preview (it shows every change as it is made) ----
+function editOpen(id) {
+  var src = id ? userTheme(id) : null, now = themeNow(), d;
+  if (USER.draft || !ui.editor) return;
+  if (src) d = cleanTheme(src, true);                      // a copy: nothing is kept until SAVE
+  else {
+    d = { id: newId('u-'), name: freeName('My theme'), jp: '', user: true };
+    COLOURS.forEach(function (c) { d[c[0]] = now[c[0]]; });   // starts from the colours showing now
+  }
+  if (!d) return;
+  USER.draft = d;
+  USER.draftPhotoWas = src && src.photo ? src.photo.key : '';
+  closePanel();
+  editSay('');
+  editFill();
+  ui.editor.setAttribute('data-open', '1');
+  document.documentElement.setAttribute('data-mp-edit', '1');
+  retheme();
+  setTimeout(relayout, 60);
+}
+function editHide() {
+  if (ui.editor) ui.editor.setAttribute('data-open', '0');
+  document.documentElement.removeAttribute('data-mp-edit');
+  setTimeout(relayout, 60);
+}
+// what the editor's controls show, from the theme being edited
+function editFill() {
+  var d = USER.draft, ed = ui.editor, els, i, k, p;
+  if (!d || !ed) return;
+  ui.edName.value = d.name;
+  els = ed.querySelectorAll('[data-c]');
+  for (i = 0; i < els.length; i++) els[i].value = d[els[i].getAttribute('data-c')];
+  els = ed.querySelectorAll('[data-hx]');
+  for (i = 0; i < els.length; i++) { els[i].value = d[els[i].getAttribute('data-hx')]; els[i].removeAttribute('data-bad'); }
+  p = d.photo || null;
+  ui.edThumb.style.backgroundImage = p && p.thumb ? 'url("' + p.thumb + '")' : 'none';
+  ui.edThumb.setAttribute('data-has', p ? '1' : '0');
+  ui.edNoPhoto.hidden = !p;
+  ui.edOpts.hidden = !p;
+  if (!p) return;
+  els = ed.querySelectorAll('[data-fit]');
+  for (i = 0; i < els.length; i++) els[i].setAttribute('aria-pressed', els[i].getAttribute('data-fit') === p.fit ? 'true' : 'false');
+  els = ed.querySelectorAll('[data-p]');
+  for (i = 0; i < els.length; i++) els[i].value = p[els[i].getAttribute('data-p')];
+  editVals();
+}
+// the numbers beside the sliders
+function editVals() {
+  var p = USER.draft && USER.draft.photo, els = ui.editor.querySelectorAll('[data-v]'), i, j, k;
+  for (i = 0; i < els.length; i++) {
+    k = els[i].getAttribute('data-v');
+    for (j = 0; j < PHOTO_KNOBS.length; j++) if (PHOTO_KNOBS[j][0] === k) els[i].textContent = p ? p[k] + PHOTO_KNOBS[j][5] : '';
+  }
+}
+function editSay(text) {
+  if (!ui.edMsg) return;
+  ui.edMsg.textContent = text;
+  ui.edMsg.hidden = !text;
+}
+function onEditInput(e) {
+  var d = USER.draft, t = e.target, k, v, pair, j;
+  if (!d || !t || !t.getAttribute) return;
+  if (t === ui.edName) { d.name = t.value; return; }
+  if ((k = t.getAttribute('data-c'))) {                    // a colour, from the picker
+    if (!HEX.test(t.value)) return;
+    d[k] = t.value.toLowerCase();
+    pair = ui.editor.querySelector('[data-hx="' + k + '"]');
+    if (pair) { pair.value = d[k]; pair.removeAttribute('data-bad'); }
+    retheme();
+    return;
+  }
+  if ((k = t.getAttribute('data-hx'))) {                   // a colour, typed as a code: #1a2b3c, 1a2b3c or #abc
+    v = t.value.trim();
+    if (v.charAt(0) !== '#') v = '#' + v;
+    if (/^#[0-9a-f]{3}$/i.test(v)) v = '#' + v.charAt(1) + v.charAt(1) + v.charAt(2) + v.charAt(2) + v.charAt(3) + v.charAt(3);
+    if (!HEX.test(v)) { t.setAttribute('data-bad', '1'); return; }
+    t.removeAttribute('data-bad');
+    d[k] = v.toLowerCase();
+    pair = ui.editor.querySelector('[data-c="' + k + '"]');
+    if (pair) pair.value = d[k];
+    retheme();
+    return;
+  }
+  if ((k = t.getAttribute('data-p')) && d.photo) {          // one of the photo's sliders
+    for (j = 0; j < PHOTO_KNOBS.length; j++)
+      if (PHOTO_KNOBS[j][0] === k) d.photo[k] = limit(t.value, PHOTO_KNOBS[j][2], PHOTO_KNOBS[j][3], PHOTO_KNOBS[j][6]);
+    editVals();
+    applyTheme();
+  }
+}
+// a photo that was picked in the editor but never saved goes again
+function editDropPhoto() {
+  var d = USER.draft, rec = d && d.photo ? USER.photos[d.photo.key] : null;
+  if (!rec || rec.saved) return;
+  if (rec.url) { try { URL.revokeObjectURL(rec.url); } catch (e) {} }
+  delete USER.photos[d.photo.key];
+}
+function editPhotoPicked(file) {
+  editSay('READING THE PHOTO...');
+  return readPhoto(file, false).then(function (r) {
+    var d = USER.draft, key = newId('p-'), was;
+    if (!d) return;
+    was = d.photo || {};
+    editDropPhoto();
+    USER.photos[key] = { url: URL.createObjectURL(r.blob), blob: r.blob, saved: false };
+    d.photo = cleanPhoto(was, key);                        // a new picture keeps the settings of the one before
+    d.photo.thumb = r.thumb;
+    editSay('');
+    editFill();
+    applyTheme();
+  }, function (e) { editSay(errText(e)); });
+}
+function editNoPhoto() {
+  var d = USER.draft;
+  if (!d || !d.photo) return;
+  editDropPhoto();
+  delete d.photo;
+  editFill();
+  applyTheme();
+}
+function editSave() {
+  var d = USER.draft, rec, put = Promise.resolve(), trouble = '';
+  if (!d) return put;
+  d.name = cleanName(d.name);
+  rec = d.photo ? USER.photos[d.photo.key] : null;
+  if (rec && !rec.saved && rec.blob)
+    put = photoPut(d.photo.key, rec.blob).then(function () { rec.saved = true; },
+      function (e) { trouble = 'ITS PHOTO WILL BE GONE WHEN THE APP CLOSES (' + errText(e) + ')'; });
+  return put.then(function () {
+    var at = -1, i, old = USER.draftPhotoWas;
+    if (USER.draft !== d) return;
+    for (i = 0; i < USER.list.length; i++) if (USER.list[i].id === d.id) at = i;
+    if (at >= 0) USER.list[at] = d; else USER.list.push(d);
+    if (!saveUserThemes()) trouble = 'IT COULD NOT BE KEPT: THE STORAGE IS FULL';
+    if (old && (!d.photo || d.photo.key !== old)) dropPhoto(old);     // the photo it had before is no longer used
+    USER.draft = null;
+    editHide();
+    renderUserThemes();
+    setTheme(d.id);
+    openPanel();
+    userSay(trouble ? 'SAVED "' + d.name + '", BUT ' + trouble : 'SAVED: ' + d.name, !trouble);
+  });
+}
+function editCancel() {
+  if (!USER.draft) return;
+  editDropPhoto();
+  USER.draft = null;
+  editHide();
+  retheme();
+  openPanel();
+}
+// the player changed size without the window doing so (the editor came or went)
+function relayout() {
+  placeControls();
+  if (deckShown()) { setMarquee(S.marquee, true); kickViz(); vzKick(); }
+  if (S.mode === 'full' && B.vlist) B.vlist.update(false);
+}
+
+// ---- the list in the themes panel ----
+// miniature of a theme: body (with its photo), lamp, display with bars
+function swatchFor(t) {
+  var prev = h('div', { class: 'mp-swatch-prev' });
+  var dot = h('div', { class: 'mp-swatch-dot' }), lcd = h('div', { class: 'mp-swatch-lcd' });
+  var body = 'linear-gradient(180deg,' + t.shellA + ',' + t.shellB + ')', a;
+  if (t.user && t.photo && t.photo.thumb) {
+    a = (t.photo.tint / 100).toFixed(2);
+    body = 'linear-gradient(180deg,rgba(' + hexToRgb(t.shellA).join(',') + ',' + a + '),rgba(' + hexToRgb(t.shellB).join(',') + ',' + a + ')),' +
+      'url("' + t.photo.thumb + '") center/cover';
+  }
+  prev.style.background = body;
+  dot.style.background = t.lit;
+  dot.style.boxShadow = '0 0 5px ' + t.lit;
+  lcd.style.background = t.lcdBg;
+  [0.5, 0.9, 0.65, 1, 0.4, 0.75, 0.55, 0.3, 0.6, 0.35].forEach(function (v) {
+    var bar = h('i');
+    bar.style.background = t.lcdFg;
+    bar.style.height = Math.round(v * 100) + '%';
+    lcd.appendChild(bar);
+  });
+  prev.appendChild(dot);
+  prev.appendChild(lcd);
+  return h('button', { class: 'mp-swatch', 'data-theme': t.id, type: 'button', 'aria-pressed': 'false', title: t.name },
+    prev, h('div', { class: 'mp-swatch-name' }, h('span', { class: 'mp-swatch-en', text: t.name }), t.jp ? jp(t.jp, 'mp-swatch-jp') : null));
+}
+function renderUserThemes() {
+  if (!ui.userGrid) return;
+  var frag = document.createDocumentFragment();
+  USER.list.forEach(function (t) { frag.appendChild(swatchFor(t)); });
+  ui.userGrid.replaceChildren(frag);
+  ui.userEmpty.hidden = USER.list.length > 0;
+  syncPanel();
+}
+// a line in the panel (and on the player) about what just happened
+function userSay(text, good) {
+  if (ui.userMsg) {
+    ui.userMsg.textContent = text;
+    ui.userMsg.setAttribute('data-kind', good ? 'ok' : 'warn');
+    ui.userMsg.hidden = false;
+    clearTimeout(USER.msgTimer);
+    USER.msgTimer = setTimeout(function () { ui.userMsg.hidden = true; }, 10000);
+    if (S.panelOpen && ui.userMsg.scrollIntoView) ui.userMsg.scrollIntoView({ block: 'nearest' });   // (the list is at the foot of a long panel)
+  }
+  notice(text, good);
+}
+function disarmDelete() {
+  clearTimeout(USER.armTimer);
+  if (!ui.userDelete) return;
+  ui.userDelete.removeAttribute('data-arm');
+  ui.userDelete.querySelector('span').textContent = 'DELETE';
 }
 
 // ------------------------------------------------------ playback (MusicKit) --
@@ -4162,6 +4699,24 @@ var ACT = {
     openSongMenu(songFromItem(it), box.left, box.bottom + 6, {});
   },
   closepanel: function () { closePanel(); },
+  // themes of your own
+  themenew: function () { editOpen(''); },
+  themeedit: function () { if (userTheme(S.theme)) editOpen(S.theme); },
+  themeexport: function () { exportTheme(S.theme); },
+  themeimport: function () { if (ui.userFile) { ui.userFile.value = ''; ui.userFile.click(); } },
+  themedelete: function () {                      // asks once more: press it twice
+    var t = userTheme(S.theme), b = ui.userDelete;
+    if (!t || !b) return;
+    if (b.getAttribute('data-arm') === '1') { disarmDelete(); deleteTheme(t.id); userSay('DELETED: ' + t.name, true); return; }
+    b.setAttribute('data-arm', '1');
+    b.querySelector('span').textContent = 'SURE? PRESS AGAIN';
+    clearTimeout(USER.armTimer);
+    USER.armTimer = setTimeout(disarmDelete, 3500);
+  },
+  editsave: function () { editSave(); },
+  editcancel: function () { editCancel(); },
+  editphoto: function () { if (ui.edFile) { ui.edFile.value = ''; ui.edFile.click(); } },
+  editnophoto: function () { editNoPhoto(); },
   ontop: function () { setOnTop(!S.onTop); },
   pl: function () { setPanel('pl', !S.showPl); },
   viz: function () { setPanel('viz', !S.showViz); },
@@ -4633,25 +5188,35 @@ function buildPanel() {
 
   var body = h('div', { class: 'mp-panel-body' });
   var grid = h('div', { class: 'mp-themes' });
-  THEMES.forEach(function (t) {
-    var prev = h('div', { class: 'mp-swatch-prev' });
-    var dot = h('div', { class: 'mp-swatch-dot' }), lcd = h('div', { class: 'mp-swatch-lcd' });
-    prev.style.background = 'linear-gradient(180deg,' + t.shellA + ',' + t.shellB + ')';
-    dot.style.background = t.lit;
-    dot.style.boxShadow = '0 0 5px ' + t.lit;
-    lcd.style.background = t.lcdBg;
-    [0.5, 0.9, 0.65, 1, 0.4, 0.75, 0.55, 0.3, 0.6, 0.35].forEach(function (v) {
-      var bar = h('i');
-      bar.style.background = t.lcdFg;
-      bar.style.height = Math.round(v * 100) + '%';
-      lcd.appendChild(bar);
-    });
-    prev.appendChild(dot);
-    prev.appendChild(lcd);
-    grid.appendChild(h('button', { class: 'mp-swatch', 'data-theme': t.id, type: 'button', 'aria-pressed': 'false', title: t.name },
-      prev, h('div', { class: 'mp-swatch-name' }, h('span', { class: 'mp-swatch-en', text: t.name }), jp(t.jp, 'mp-swatch-jp'))));
-  });
+  THEMES.forEach(function (t) { grid.appendChild(swatchFor(t)); });
   body.appendChild(grid);
+
+  // ---- themes of your own: make, pick, edit, and carry to another computer ----
+  body.appendChild(h('div', { class: 'mp-panel-sub mp-user-head' }, h('span', { text: 'MY THEMES' }), jp('マイテーマ'), h('span', { class: 'mp-grip' }),
+    textKey('themenew', 'NEW', '新規', 'Make a theme of your own: your colours, and a photo behind the player', I.plus),
+    textKey('themeimport', 'IMPORT', '読込', 'Open a skin file (.mpskin) made here or on your other computer')));
+  ui.userEmpty = h('div', { class: 'mp-hint mp-user-empty', text: 'None yet. NEW starts one from the colours showing now: change any colour, put a photo behind the player, ' +
+    'then EXPORT it as a file that also opens in Music Player on your other computer (IMPORT there).' });
+  ui.userGrid = h('div', { class: 'mp-themes mp-themes-user' });
+  ui.userDelete = textKey('themedelete', 'DELETE', '削除', 'Delete the theme in use (asks once more)');
+  ui.userTools = h('div', { class: 'mp-user-tools', hidden: true },
+    textKey('themeedit', 'EDIT', '編集', 'Change the colours or the photo of the theme in use'),
+    textKey('themeexport', 'EXPORT', '書出', 'Save the theme in use as a file (.mpskin) that opens on Windows and on a Mac'),
+    ui.userDelete);
+  ui.userMsg = h('div', { class: 'mp-user-msg', hidden: true, role: 'status' });
+  ui.userFile = h('input', { type: 'file', accept: '.mpskin,.json,application/json', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
+  ui.userFile.addEventListener('change', function () {
+    var f = ui.userFile.files && ui.userFile.files[0];
+    if (!f) return;
+    importSkin(f).then(function (res) {
+      userSay('IMPORTED: ' + res.theme.name + (res.trouble ? ' - BUT ' + res.trouble : ''), !res.trouble);
+    }, function (e) { userSay('COULD NOT IMPORT: ' + errText(e), false); });
+  });
+  body.appendChild(ui.userEmpty);
+  body.appendChild(ui.userGrid);
+  body.appendChild(ui.userTools);
+  body.appendChild(ui.userMsg);
+  body.appendChild(ui.userFile);
 
   body.appendChild(h('div', { class: 'mp-panel-sub' }, h('span', { text: 'COMPACT PLAYER' }), jp('設定'), h('span', { class: 'mp-grip' })));   // "settings"
   body.appendChild(h('button', { class: 'mp-opt', 'data-opt': 'autoCompact', type: 'button', role: 'switch', 'aria-checked': 'false' },
@@ -4688,12 +5253,88 @@ function buildPanel() {
     onActClick(e);
   });
   ui.panelWrap = wrap;
+  renderUserThemes();
   return wrap;
+}
+
+// The editor for a theme of your own (see "Themes of your own").
+function buildEditor() {
+  var ed = h('div', { id: 'mp-editor', class: 'mp-ui', 'data-open': '0', role: 'dialog', 'aria-label': 'Edit theme' });
+  var sub = function (en, ja) { return h('div', { class: 'mp-panel-sub' }, h('span', { text: en }), jp(ja), h('span', { class: 'mp-grip' })); };
+  ed.appendChild(h('div', { class: 'mp-panel-head' },
+    h('span', { class: 'mp-panel-title', text: 'EDIT THEME' }), jp('テーマ編集', 'mp-panel-title-jp'),
+    h('span', { class: 'mp-grip' }),
+    h('button', { class: 'mp-key mp-x', 'data-act': 'editcancel', type: 'button', title: 'Close without saving', 'aria-label': 'Close without saving' }, svg(I.close))));
+
+  var body = h('div', { class: 'mpe-body' });
+  body.appendChild(h('div', { class: 'mp-hint mpe-hint', text: 'The player beside this shows every change as you make it. Nothing is kept until you press SAVE.' }));
+  ui.edName = h('input', { class: 'mpm-input mpe-name', type: 'text', maxlength: '40', spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Name of the theme' });
+  body.appendChild(h('label', { class: 'mpe-row' }, h('span', { class: 'mpe-label', text: 'Name' }), ui.edName));
+
+  body.appendChild(sub('COLOURS', '色'));
+  COLOURS.forEach(function (c) {
+    body.appendChild(h('div', { class: 'mpe-row' },
+      h('span', { class: 'mpe-label', text: c[1] }),
+      h('input', { class: 'mpe-colour', type: 'color', 'data-c': c[0], 'aria-label': c[1], title: c[1] + ': click to pick a colour' }),
+      h('input', { class: 'mpm-input mpe-hex', type: 'text', maxlength: '7', spellcheck: 'false', autocomplete: 'off', 'data-hx': c[0],
+        'aria-label': c[1] + ', as a colour code', title: 'Or type a colour code, like #ff4fa3' })));
+  });
+
+  body.appendChild(sub('PHOTO', '写真'));
+  ui.edThumb = h('div', { class: 'mpe-thumb', 'data-has': '0' });
+  ui.edNoPhoto = textKey('editnophoto', 'REMOVE', '削除', 'Take the photo out of this theme');
+  body.appendChild(h('div', { class: 'mpe-photo' }, ui.edThumb,
+    h('div', { class: 'mpe-photo-keys' },
+      textKey('editphoto', 'CHOOSE PHOTO', '選択', 'Put a picture from this computer behind the player', I.plus), ui.edNoPhoto)));
+  ui.edOpts = h('div', { class: 'mpe-opts', hidden: true });
+  var fits = h('div', { class: 'mpe-fits', role: 'group', 'aria-label': 'How the photo fills the player' });
+  FITS.forEach(function (f) {
+    fits.appendChild(h('button', { class: 'mp-key mpe-fit', type: 'button', 'data-fit': f[0], 'aria-pressed': 'false', text: f[1] }));
+  });
+  ui.edOpts.appendChild(fits);
+  PHOTO_KNOBS.forEach(function (k) {
+    ui.edOpts.appendChild(h('label', { class: 'mpe-row' }, h('span', { class: 'mpe-label', text: k[1] }),
+      h('input', { class: 'mpe-range', type: 'range', min: String(k[2]), max: String(k[3]), step: String(k[4]), 'data-p': k[0] }),
+      h('span', { class: 'mpe-val', 'data-v': k[0] })));
+  });
+  body.appendChild(ui.edOpts);
+  ui.edMsg = h('div', { class: 'mp-user-msg mpe-msg', hidden: true, role: 'status' });
+  body.appendChild(ui.edMsg);
+  ui.edFile = h('input', { type: 'file', accept: 'image/*', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
+  ui.edFile.addEventListener('change', function () {
+    if (ui.edFile.files && ui.edFile.files[0]) editPhotoPicked(ui.edFile.files[0]);
+  });
+  body.appendChild(ui.edFile);
+  ed.appendChild(body);
+
+  ed.appendChild(h('div', { class: 'mpe-foot' },
+    textKey('editsave', 'SAVE', '保存', 'Keep this theme: it goes into MY THEMES', I.check),
+    textKey('editcancel', 'CANCEL', '取消', 'Close without saving')));
+
+  ed.addEventListener('input', onEditInput);
+  // a typed colour code is tidied once the box is left
+  ed.addEventListener('change', function (e) {
+    var k = e.target && e.target.getAttribute && e.target.getAttribute('data-hx');
+    if (k && USER.draft) { e.target.value = USER.draft[k]; e.target.removeAttribute('data-bad'); }
+  });
+  ed.addEventListener('click', function (e) {
+    var f = e.target.closest && e.target.closest('[data-fit]');
+    if (f && USER.draft && USER.draft.photo) {
+      USER.draft.photo.fit = f.getAttribute('data-fit');
+      editFill();
+      applyTheme();
+      return;
+    }
+    onActClick(e);
+  });
+  ui.editor = ed;
+  return ed;
 }
 
 function syncPanel() {
   if (!ui.panelWrap) return;
   var sw = ui.panelWrap.querySelectorAll('[data-theme]'), i;
+  if (ui.userTools) { ui.userTools.hidden = !userTheme(S.theme); disarmDelete(); }
   for (i = 0; i < sw.length; i++)
     sw[i].setAttribute('aria-pressed', sw[i].getAttribute('data-theme') === themeNow().id ? 'true' : 'false');
   var opts = ui.panelWrap.querySelectorAll('[data-opt]');
@@ -4702,7 +5343,7 @@ function syncPanel() {
 }
 
 function openPanel() {
-  if (!ui.panelWrap) return;
+  if (!ui.panelWrap || USER.draft) return;             // (a theme is being edited: SAVE or CANCEL first)
   S.panelOpen = true;
   syncPanel();
   ui.panelWrap.setAttribute('data-open', '1');
@@ -4731,6 +5372,7 @@ function buildUi() {
   ui.root.appendChild(buildApp());
   ui.root.appendChild(ui.fab);
   ui.root.appendChild(buildPanel());
+  ui.root.appendChild(buildEditor());
 
   // the song menu (one, shared by every list)
   ui.menu = h('div', { id: 'mp-menu', class: 'mp-ui', 'data-open': '0', role: 'menu' });
@@ -4870,7 +5512,7 @@ function onKey(e) {
   }
   if (typing) {
     // keep Apple's own page shortcuts away from what is typed into our own boxes
-    if (t === ui.search || (ui.menu && ui.menu.contains(t))) e.stopPropagation();
+    if (t === ui.search || (ui.menu && ui.menu.contains(t)) || (ui.editor && ui.editor.contains(t))) e.stopPropagation();
     return;
   }
   // Alt + Up / Down on a playlist in the library panel: move it up or down
@@ -4996,11 +5638,7 @@ whenBody(function () {
   var resizeTimer = 0;
   window.addEventListener('resize', function () {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () {
-      placeControls();
-      if (deckShown()) { setMarquee(S.marquee, true); kickViz(); vzKick(); }
-      if (S.mode === 'full' && B.vlist) B.vlist.update(false);
-    }, 120);
+    resizeTimer = setTimeout(relayout, 120);
   });
   // back on screen (un-minimised, uncovered): pick the moving parts up again
   document.addEventListener('visibilitychange', function () {
@@ -5022,5 +5660,7 @@ window.__mp = {
   state: S, themes: THEMES, db: DB, browser: B, setTheme: setTheme, setMode: setMode, go: go, float: FLOAT,
   sound: AU, viz: VZ, effects: EFFECTS, lyrics: LY, clock: CK,
   setPanel: setPanel, setEffect: vzSet, setVizBig: setVizBig, vizRetry: vzRetry, setOnTop: setOnTop,
-  parseTtml: parseTtml, fetchLyrics: lyFetch, showLyrics: lyShow, songIdsFrom: songIdsFrom
+  parseTtml: parseTtml, fetchLyrics: lyFetch, showLyrics: lyShow, songIdsFrom: songIdsFrom,
+  user: USER, userThemes: { edit: editOpen, save: editSave, cancel: editCancel, photo: editPhotoPicked, noPhoto: editNoPhoto,
+    file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor }
 };
