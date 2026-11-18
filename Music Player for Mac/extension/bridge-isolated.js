@@ -11,8 +11,9 @@
 // and hands the skin what comes back:
 //   pcm|<base64>        a stretch of the sound
 //   tapstate|<state>    on | off | click | busy | failed|<why>
-// Everything else (keep on top the Windows way, the log) needs the Windows
-// app and is ignored here.
+//   log|<text>          one line of the player's log: shown in the page's console
+// Everything else (keep on top the Windows way) needs the Windows app and is
+// ignored here.
 (function () {
   'use strict';
   if (window.top !== window) return;
@@ -68,6 +69,11 @@
       askAt = now;
       var pt = link();
       if (pt) { try { pt.postMessage({ kind: 'tap', on: true }); } catch (x) { port = null; } }
+    } else if (p[0] === 'log') {
+      // what the Windows app writes to player.log (starts, failures, the
+      // recovery's steps): here, the page's console (View > Developer >
+      // JavaScript Console), so "sometimes it does not play" can be looked into
+      try { console.info('Music Player: ' + e.data.__mpToHost.slice(4)); } catch (x) {}
     } else if (p[0] === 'focus') {
       toExtension({ kind: 'focus' });
     } else if (p[0] === 'theme' && /^[0-9a-fA-F]{6}$/.test(p[2] || '')) {

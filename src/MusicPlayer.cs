@@ -539,6 +539,10 @@ namespace MusicPlayerApp
                     WriteLog(msg.Substring(4));
                     break;
 
+                case "media":   // media|reset  (see ResetMediaHelper)
+                    if (p.Length >= 2 && p[1] == "reset") ResetMediaHelper();
+                    break;
+
                 case "tap":     // tap|1 = the visualizer wants sound (repeated while it does), tap|0 = stop
                     if (feed != null)
                     {
@@ -556,6 +560,7 @@ namespace MusicPlayerApp
         // ------------------------------------------- the song, while elsewhere --
         // (the card and Discord themselves are in NowPlaying.cs)
         NowPlaying nowPlaying;
+        Image lastArt;                          // the cover of the song before (see OnNowPlaying)
         bool popupOn = true;
         string popupPos = "tr";
         string cardKey = "";                    // the song a card was last shown for
@@ -576,9 +581,48 @@ namespace MusicPlayerApp
                         delegate(string state) { try { web.CoreWebView2.PostWebMessageAsString("discord|" + state); } catch { } },
                         opts.DiscordPipe);
                 }
-                web.CoreWebView2.PostWebMessageAsString(discord != null ? "caps|popup,discord" : "caps|popup");
+                web.CoreWebView2.PostWebMessageAsString(discord != null ? "caps|popup,discord,media" : "caps|popup,media");
             }
             catch { }
+        }
+
+        // ------------------------------------- after a playback failure --
+        // Protected songs are decoded by a helper process of the browser engine
+        // (see MediaHelper in AudioTap.cs). When the skin's own recovery has
+        // already loaded the page again once and the music still fails, it asks
+        // for this before loading it once more: the helper is ended, and the
+        // engine starts a fresh one for the new page - the part of closing and
+        // opening the app (which has always cured these failures) that a page
+        // reload leaves out. Only this app's own helper, at most once a minute,
+        // off the window's thread.
+        DateTime lastMediaReset = DateTime.MinValue;
+
+        void ResetMediaHelper()
+        {
+            if ((DateTime.UtcNow - lastMediaReset).TotalSeconds < 60) return;
+            lastMediaReset = DateTime.UtcNow;
+            int browser;
+            try { browser = (int)web.CoreWebView2.BrowserProcessId; } catch { return; }
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string said;
+                try
+                {
+                    int helper = MediaHelper.Find(browser);
+                    if (helper == 0) said = "engine: no protected-playback helper was running";
+                    else
+                    {
+                        using (Process pr = Process.GetProcessById(helper))
+                        {
+                            pr.Kill();
+                            pr.WaitForExit(3000);
+                        }
+                        said = "engine: ended the protected-playback helper (" + helper + "), the new page gets a fresh one";
+                    }
+                }
+                catch (Exception ex) { said = "engine: could not end the protected-playback helper: " + ex.Message; }
+                try { BeginInvoke((Action)delegate { WriteLog(said); }); } catch { }
+            });
         }
 
         void OnNowPlaying(string body)
@@ -586,7 +630,22 @@ namespace MusicPlayerApp
             NowPlaying np = NowPlaying.Parse(body);
             if (np == null) return;
             bool sameSong = nowPlaying != null && nowPlaying.Key == np.Key;
-            if (np.Art == null && sameSong) np.Art = nowPlaying.Art;      // (the picture comes once per song)
+            // The page sends the cover with every message about the song (a few
+            // per song). Each copy was a new picture that was never let go of -
+            // memory outside .NET's reach, so it piled up over an evening of
+            // music. Keep the one there is for this song, and let the one before
+            // the last go (a card may still be fading out with the last one; one
+            // drawn after it is gone just leaves its cover out).
+            if (sameSong && nowPlaying.Art != null)
+            {
+                if (np.Art != null && np.Art != nowPlaying.Art) { try { np.Art.Dispose(); } catch { } }
+                np.Art = nowPlaying.Art;
+            }
+            else if (nowPlaying != null && nowPlaying.Art != null && nowPlaying.Art != np.Art)
+            {
+                if (lastArt != null && lastArt != nowPlaying.Art) { try { lastArt.Dispose(); } catch { } }
+                lastArt = nowPlaying.Art;
+            }
             nowPlaying = np;
             if (discord != null) discord.Show(np);
             if (toast != null && sameSong) toast.Repaint(np);
@@ -860,7 +919,7 @@ namespace MusicPlayerApp
         // there it is moved to player.old.log and a new one is begun.
         void WriteLog(string text)
         {
-            if (opts.IsTestRun) return;
+            if (opts.IsTestRun) { testLog.AppendLine("# log: " + text); return; }      // (a test run's lines go to its own log)
             try
             {
                 string path = Path.Combine(dataDir, "player.log");

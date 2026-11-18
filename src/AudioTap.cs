@@ -66,6 +66,11 @@ internal sealed class AudioTap : IDisposable
         t.Start();
     }
 
+    // Not waited for: the thread ends by itself within a fifth of a second, or
+    // once Windows answers a request it is waiting on (up to 5 s). This is
+    // called on the app window's thread, and waiting here (it used to, up to
+    // 1.5 s for each of the two taps) held the whole window up - no clicks,
+    // no drawing - every time the visualizer stopped or the helper changed.
     public void Stop()
     {
         Thread t = thread;
@@ -73,7 +78,6 @@ internal sealed class AudioTap : IDisposable
         thread = null;
         stop = true;
         wake.Set();
-        try { t.Join(1500); } catch { }
     }
 
     public void Dispose() { Stop(); }

@@ -218,6 +218,7 @@ var S = {
   pendingAuto: false,
   seen: true,                    // false while the window is minimised or covered (the app says so)
   startTok: 0,                   // counts requests to start playing; the newest one waiting wins
+  startDone: 0,                  // the newest one that has been carried out (see starting())
   starting: Promise.resolve(),   // the start being carried out (they run one after another)
   haltAt: 0,                     // when Stop or Pause was last pressed
   shuffleHeld: false,            // shuffle is on for the listener but switched off for a moment (see startNow)
@@ -268,12 +269,12 @@ function themeCss() {
 }
 
 // all of the skin's styles: the themes, player.css, and the Mac's own extras
-function skinCss() { return themeCss() + '\n' + __MP_CSS + '\n' + MAC_CSS; }
+// (they never change: put together once, not at every once-a-second check)
+function skinCss() { return skinCss.all || (skinCss.all = themeCss() + '\n' + __MP_CSS + '\n' + MAC_CSS); }
 
 function installCss() {
-  var css = skinCss();
   try {
-    if (!sheet) { sheet = new CSSStyleSheet(); sheet.replaceSync(css); }
+    if (!sheet) { sheet = new CSSStyleSheet(); sheet.replaceSync(skinCss()); }
     if (document.adoptedStyleSheets.indexOf(sheet) < 0)
       document.adoptedStyleSheets = document.adoptedStyleSheets.concat([sheet]);
     return;
@@ -281,7 +282,7 @@ function installCss() {
   if (!document.getElementById('mp-style')) {
     var st = document.createElement('style');
     st.id = 'mp-style';
-    st.textContent = css;
+    st.textContent = skinCss();
     (document.head || document.documentElement).appendChild(st);
   }
 }
@@ -1848,7 +1849,7 @@ function authorized() {
 function call(name) {
   var m = S.music;
   if (!m || typeof m[name] !== 'function') return;
-  if (name === 'play' || name === 'skipToNextItem' || name === 'skipToPreviousItem' || name === 'changeToMediaAtIndex') RC.wantAt = performance.now();
+  if (name === 'play' || name === 'skipToNextItem' || name === 'skipToPreviousItem' || name === 'changeToMediaAtIndex') rcWant();
   try {
     var r = m[name].apply(m, Array.prototype.slice.call(arguments, 1));
     if (r && typeof r.catch === 'function') r.catch(function () {});
@@ -1991,6 +1992,11 @@ function onState() {
 //   3. if that fails too, or Windows was seen taking the keys away: the page
 //      is loaded again (Windows app) and carries on from the note, left in
 //      sessionStorage for the new page
+//   4. if the music fails again after that: once more, with the app also
+//      ending the engine's protected-playback helper (see ResetMediaHelper
+//      in src\MusicPlayer.cs), so the new page gets a fresh one
+// A failure need not come with a message: music wanted and no song moving
+// for 20 s counts as one too (rcWatch).
 // At most one of each in a row; after that the message stays up and it is the
 // listener's turn. Failures that trying again cannot change (another device
 // is playing, the subscription, a song that is not available) are only
@@ -2001,7 +2007,10 @@ var RC = {
   id: '', pos: -1, t: 0,          // the song last heard playing, where in the queue, and how far in (seconds)
   at: -1e9,                       // when that was (performance.now())
   wantAt: -1e9,                   // when the listener last asked for music
-  busyAt: 0,                      // since when the player has been "loading" with nothing playing
+  playSeen: -1e9,                 // when the player last said "playing" (whether or not the music moved)
+  hungSince: 0,                   // since when music has been wanted but none heard (see rcWatch)
+  gaveUp: false,                  // rcWatch tried what there is to try: quiet until music plays or is asked for again
+  errAt: 0,                       // when the failure being dealt with came
   healthyAt: 0,                   // since when music has been playing without trouble
   streak: false,                  // a try is on record (see rcStreak)
   sysClosedAt: 0, sysClosedWhy: '',   // Windows closed a key session by itself
@@ -2029,11 +2038,24 @@ function rcStreakSet(s) {
   try { if (s) sessionStorage.setItem('mp.rc', JSON.stringify(s)); else sessionStorage.removeItem('mp.rc'); } catch (e) {}
 }
 
+// A song's id that a list of songs handed to the player can hold. A song of a
+// library playlist that is not in the library itself comes as
+// "a.<catalogue id>": the catalogue id plays the same song.
 function rcSongId(it) {
-  var id = '', type = '';
+  var id = '', type = '', cid = '', a;
   try { id = String(it.id || ''); type = String(it.type || ''); } catch (e) {}
   if (type && !/song/i.test(type)) return '';      // a music video, a radio station: not something a list of songs can hold
-  return RC_SONG.test(id) ? id : '';
+  if (RC_SONG.test(id)) return id;
+  try { cid = String((it.attributes && it.attributes.playParams && it.attributes.playParams.catalogId) || ''); } catch (e) {}
+  if (/^\d{3,}$/.test(cid)) return cid;
+  a = /^a\.(\d{3,})$/.exec(id);
+  return a ? a[1] : '';
+}
+// which song an item is, for telling songs apart (also ones that cannot be handed back)
+function rcItemId(it) {
+  var id = '';
+  try { id = String((it && it.id) || ''); } catch (e) {}
+  return rcSongId(it) || id;
 }
 function rcIds(items) {
   var ids = [];
@@ -2045,24 +2067,33 @@ function rcQueue() {
   var items = queueItems();
   if (items.length) RC.ids = rcIds(items);
 }
-// music is playing: where it is
+// The listener asked for music (a start, play, a skip).
+function rcWant() {
+  RC.wantAt = performance.now();
+  RC.gaveUp = false;
+}
+// Music is playing: where it is. Only a clock that moves counts as music
+// heard - the player can say "playing" with the song standing still.
 function rcTick() {
   var m = S.music, it = nowItem(), t = 0;
   if (!m || !it || stateName() !== 'playing') return;
   try { t = m.currentPlaybackTime || 0; } catch (e) {}
   if (!(t > 0)) return;
-  RC.id = String(it.id || '');
-  RC.pos = curIndex();
+  var id = rcItemId(it), pos = curIndex();
+  if (id === RC.id && pos === RC.pos && t === RC.t) return;      // no further on
+  RC.id = id;
+  RC.pos = pos;
   RC.t = t;
   RC.at = performance.now();
-  RC.busyAt = 0;
+  RC.hungSince = 0;
+  RC.gaveUp = false;
   if (!RC.streak) return;
   if (!RC.healthyAt) RC.healthyAt = RC.at;
   else if (RC.at - RC.healthyAt > 90000) rcStreakSet(null);     // all is well again: the next failure is a new one
 }
-// Was music playing, or being asked for, just now?
+// Was music playing (or saying so), or being asked for, just now?
 function rcWanted() {
-  var last = Math.max(RC.at, RC.wantAt);
+  var last = Math.max(RC.at, RC.wantAt, RC.playSeen);
   return last > S.haltAt && performance.now() - last < 60000;
 }
 
@@ -2075,7 +2106,7 @@ function rcNote() {
   if (pos < 0 || !ids[pos]) return null;
   if (ids[pos] === RC.id) {
     t = RC.t;
-    try { if (String(nowItem().id) === RC.id && m.currentPlaybackTime > t) t = m.currentPlaybackTime; } catch (e) {}
+    try { if (rcItemId(nowItem()) === RC.id && m.currentPlaybackTime > t) t = m.currentPlaybackTime; } catch (e) {}
   }
   var list = [], at = -1;
   for (i = Math.max(0, pos - 30); i < ids.length && list.length < QUEUE_CHUNK + 30; i++) {
@@ -2146,13 +2177,20 @@ function onPlaybackError(e) {
   var fresh = /MEDIA_KEY|MEDIA_LICENSE|MEDIA_SESSION|MEDIA_CERTIFICATE|LICENSE|PLAYREADY|MediaKey/i.test(all) &&
     RC.sysClosedAt > 0 && performance.now() - RC.sysClosedAt < 900000;
   clearTimeout(RC.timer);
+  RC.errAt = performance.now();
   RC.timer = setTimeout(function () { rcAfterError(what, fresh, 0); }, 2000);
 }
 
 // A little after a failure: has the player carried on by itself (it skips a
-// song it cannot play), is it still at it, or has it given up?
+// song it cannot play), is it still at it, or has it given up? And has the
+// listener picked something else meanwhile - then that is what plays, not
+// the queue from before.
 function rcAfterError(what, fresh, n) {
   var name = stateName();
+  if (RC.wantAt > RC.errAt || S.haltAt > RC.errAt || starting()) {
+    dlog('recover: the listener has done something else since, leaving it');
+    return;
+  }
   if (name === 'playing' && performance.now() - RC.at < 1200) return;              // music: nothing to do
   var busy = name === 'playing' || name === 'loading' || name === 'waiting' || name === 'stalled' || name === 'seeking';
   if (busy && n < 7) { RC.timer = setTimeout(function () { rcAfterError(what, fresh, n + 1); }, 1000); return; }   // a few seconds more
@@ -2162,12 +2200,18 @@ function rcAfterError(what, fresh, n) {
 // The next thing to try, if there is one left.
 function rcNext(what, fresh) {
   var s = rcStreak(), note = rcWanted() ? rcNote() : null;
+  var win = HOST_KIND === 'windows' && !USER.draft;                  // (not from under an open theme editor: what is in it would be lost)
   var soft = s.n === 0 && !(fresh && HOST_KIND === 'windows');
-  var hard = HOST_KIND === 'windows' && !s.hard && !USER.draft;      // (not from under an open theme editor: what is in it would be lost)
+  var hard = win && !s.hard;
+  // a new page has been tried already and the music failed again: once more,
+  // and this time the app also ends the engine's protected-playback helper,
+  // which a new page alone keeps (closing and opening the app has always
+  // cured these; this is the part of that a reload leaves out)
+  var reset = win && s.hard && !s.reset && /\bmedia\b/.test(NP.caps || '');
   clearTimeout(RC.timer);
   RC.working = 0;
   if (!note) return false;                                           // nothing that can be handed back: the message is all
-  if (!soft && !hard) {
+  if (!soft && !hard && !reset) {
     dlog('recover: tried what there is to try, leaving it');
     notice('PLAYBACK ERROR: ' + what + rcHint());
     return false;
@@ -2181,7 +2225,7 @@ function rcNext(what, fresh) {
     rcStart(note, false, what);
     return true;
   }
-  s.hard = true;
+  if (hard) s.hard = true; else s.reset = true;
   note.at = Date.now();
   note.mode = S.mode === 'compact' ? 'compact' : 'full';
   note.auth = authorized();
@@ -2190,10 +2234,11 @@ function rcNext(what, fresh) {
   try { sessionStorage.setItem('mp.resume', JSON.stringify(note)); }
   catch (e) { notice('PLAYBACK ERROR: ' + what + rcHint()); return false; }
   rcStreakSet(s);
-  dlog('recover: loading the page again to carry on (' + note.ids.length + ' songs, number ' + (note.pos + 1) + ', ' + note.t + ' s in)');
+  dlog('recover: loading the page again' + (hard ? '' : ' with a fresh protected-playback helper') + ' to carry on (' + note.ids.length + ' songs, number ' + (note.pos + 1) + ', ' + note.t + ' s in)');
   notice('PLAYBACK STOPPED - STARTING THE PLAYER AGAIN, ONE MOMENT');
   RC.working = -1;
-  setTimeout(function () { RC.reload(); }, 600);
+  if (!hard) send('media|reset');
+  setTimeout(function () { RC.reload(); }, hard ? 600 : 1500);
   return true;
 }
 
@@ -2208,19 +2253,19 @@ function rcStart(note, back, what) {
     try { if (mk && mk.PlayerShuffleMode) m.shuffleMode = note.shuffle ? mk.PlayerShuffleMode.songs : mk.PlayerShuffleMode.off; } catch (e) {}
     refreshModes();
   }
-  startQueue({ songs: note.ids, startWith: note.pos });
+  startQueue({ songs: note.ids, startWith: note.pos }, undefined, { id: note.id, cid: note.id });
   var tok = S.startTok, started = 0;
   S.starting.then(function () { started = performance.now(); });
   (function look() {
     if (RC.working !== run) return;                                          // failed meanwhile: dealt with elsewhere
     if (S.startTok !== tok || S.haltAt > since) { RC.working = 0; return; }  // the listener has done something else
-    var it = nowItem(), t = 0;
+    var it = nowItem(), t = 0, same = rcItemId(it) === note.id;
     try { t = m.currentPlaybackTime || 0; } catch (e) {}
     // (music heard after the queue was handed over: not what was left of the old one)
     if (started && stateName() === 'playing' && it && RC.at > started) {
       RC.working = 0;
-      if (String(it.id) === note.id && note.t > 5 && t < note.t - 3) call('seekToTime', note.t);
-      dlog('recover: playing again' + (String(it.id) === note.id ? '' : ' (another song: ' + it.id + ')'));
+      if (same && note.t > 5 && t < note.t - 3) call('seekToTime', note.t);
+      dlog('recover: playing again' + (same ? '' : ' (another song: ' + rcItemId(it) + ')'));
       notice(back ? 'THE PLAYER WAS STARTED AGAIN - CARRYING ON' : 'PLAYING AGAIN', true);
       return;
     }
@@ -2239,6 +2284,8 @@ function rcBoot() {
   RC.working = -1;
   (function ready() {
     if (!S.music) { RC.working = 0; return; }
+    // the listener has already picked something on the new page: that wins
+    if (S.startTok || RC.wantAt > -1e9 || S.haltAt) { RC.working = 0; dlog('recover: something else was picked on the new page, leaving it'); return; }
     if (note.auth && !authorized()) {
       if (++n < 80) { setTimeout(ready, 250); return; }
       RC.working = 0;
@@ -2252,19 +2299,30 @@ function rcBoot() {
   })();
 }
 
-// "Loading" for 20 seconds with nothing playing is the same failure without
-// a message. (Checked once a second.)
+// Music wanted and none heard for 20 seconds is the same failure without a
+// message: "loading" that never ends, a start the player said "ok" to and
+// then did nothing with, or - seen in the log - "playing" with the song's
+// clock standing still for forty minutes, in silence, until the engine
+// finally gave up with "No more data is available". (Checked once a second.)
 function rcWatch() {
-  var name = stateName(), now = performance.now();
-  if (RC.working || !navigator.onLine || !(name === 'loading' || name === 'waiting' || name === 'stalled' || name === 'seeking')) { RC.busyAt = 0; return; }
-  if (!RC.busyAt) { RC.busyAt = now; return; }
-  if (now - RC.busyAt < 20000) return;
-  RC.busyAt = 0;
-  if (!rcWanted() || !rcNote()) return;
-  dlog('playback: still ' + name + ' after 20 s');
+  var name = stateName(), now = performance.now(), it = nowItem();
+  if (name === 'playing') RC.playSeen = now;
+  var busy = name === 'loading' || name === 'waiting' || name === 'stalled' || name === 'seeking';
+  var stuck = busy || (name === 'playing' && !!it && !!rcSongId(it)) ||          // (a live radio station's clock may well stand still)
+    ((name === 'none' || name === 'stopped') && !!it && RC.wantAt > RC.at);       // (asked for, never started)
+  if (!stuck || RC.working || RC.gaveUp || !navigator.onLine || !rcWanted()) { RC.hungSince = 0; return; }
+  if (!RC.hungSince) RC.hungSince = now;
+  // from the last sign of life: music heard, or the listener asking for it
+  // (a fresh request gets a few seconds of its own, and a start under way
+  // sees to itself)
+  var since = Math.max(RC.hungSince, RC.at);
+  if (now - since < 20000 || now - RC.wantAt < 8000 || starting()) return;
+  RC.hungSince = 0;
+  var froze = name === 'playing';
+  dlog('playback: ' + (froze ? '"playing", but the song has not moved' : 'still ' + name) + ' for ' + Math.round((now - since) / 1000) + ' s');
   dlog('  ' + rcDetail('stuck'));
   if (RC.asked.length) dlog('  ' + rcAsked());
-  rcNext('Nothing would play', true);
+  if (!rcNext(froze ? 'Playback froze' : 'Nothing would play', true)) RC.gaveUp = true;
 }
 
 // Key sessions: note when one is closed that the page did not close itself.
@@ -2491,7 +2549,7 @@ function renderQueue() {
   for (var i = 0; i < max; i++) {
     var info = itemInfo(items[i]);
     total += info.dur;
-    frag.appendChild(h('div', { class: 'mpc-row', 'data-i': String(i), role: 'option' },
+    frag.appendChild(h('div', { class: 'mpc-row', 'data-i': String(i), 'data-id': rcItemId(items[i]), role: 'option' },
       h('span', { class: 'n', text: (i + 1) + '.' }),
       h('span', { class: 't', text: (info.artist ? info.artist + ' - ' : '') + info.title }),
       h('span', { class: 'd', text: info.dur ? fmt(info.dur) : '' })));
@@ -2532,7 +2590,7 @@ function onListClick(e) {
   var prev = ui.list.querySelector('.mpc-row[data-sel="1"]');
   if (prev) prev.removeAttribute('data-sel');
   row.setAttribute('data-sel', '1');
-  if (e.type === 'dblclick') call('changeToMediaAtIndex', parseInt(row.getAttribute('data-i'), 10));
+  if (e.type === 'dblclick') jumpTo(parseInt(row.getAttribute('data-i'), 10), row.getAttribute('data-id') || '');
 }
 
 // ---------------------------------------------------------------- sliders ----
@@ -2657,6 +2715,7 @@ function vizFrame(now) {
   var c = ui.viz, dpr = drawWin().devicePixelRatio || 1;
   var w = Math.round(c.clientWidth * dpr), ht = Math.round(c.clientHeight * dpr);
   if (!deckShown() || !S.seen || !w || !ht) { viz.last = 0; return; }
+  if (viz.last && now - viz.last < 13) { viz.raf = nextFrame(vizFrame); return; }     // (a 144 Hz screen asks twice as often as the bars can show)
   if (c.width !== w || c.height !== ht) { c.width = w; c.height = ht; }
 
   var dt = viz.last ? Math.min(64, now - viz.last) : 16;
@@ -3946,7 +4005,7 @@ function vzFrame(now) {
   VZ.raf = 0;
   if (!vzVisible()) return;
   VZ.raf = nextFrame(vzFrame);
-  if (now - VZ.last < 11.5) return;                   // 60 to 85 pictures a second, however fast the screen is
+  if (now - VZ.last < (S.state === 'play' ? 11.5 : 30)) return;     // 60 to 85 pictures a second, however fast the screen is (about 30 with nothing playing)
   var dt = VZ.last ? Math.min(0.1, (now - VZ.last) / 1000) : 0.016;
   VZ.last = now;
   VZ.t += dt;
@@ -4971,71 +5030,161 @@ function shuffleOn() {
 // shuffle true / false: set the shuffle switch first (the SHUFFLE keys do).
 // Left out: the listener picked one particular song, and that song has to
 // play first whatever the switch says.
-function startQueue(opts, shuffle) {
+// want: that song ({id, cid} as the lists know it), so the start can check
+// that it is the one that plays (see startNow).
+function startQueue(opts, shuffle, want) {
   var m = S.music, mk = MK();
   if (!m) return;
   // Starts run one after another (two at once trip the player up); when
   // several are waiting, only the newest is carried out.
   var tok = ++S.startTok;
+  rcWant();
+  function done() { if (tok === S.startTok) S.startDone = tok; }
   S.starting = S.starting.then(function () {
-    return tok === S.startTok ? startNow(m, mk, opts, shuffle) : null;
-  });
+    return tok === S.startTok ? startNow(m, mk, opts, shuffle, want, tok) : null;
+  }).then(done, done);
 }
+// Is a start waiting or under way?
+function starting() { return S.startDone !== S.startTok; }
 
 function reallyPlaying() {
   var s = stateName();
   return !!nowItem() && s !== 'none' && s !== 'stopped' && s !== 'ended' && s !== 'completed';
 }
 
+// Is this item of the player's queue that song? Apple gives one song several
+// names: a library id (i.…), the catalogue id, and in a library playlist a
+// song that is not in the library itself comes as "a.<catalogue id>".
+function itemIs(it, want) {
+  if (!it || !want) return false;
+  var keys = [], pp = null, i, k;
+  try { keys.push(String(it.id || '')); } catch (e) {}
+  try { pp = it.attributes && it.attributes.playParams; } catch (e) {}
+  if (pp) { keys.push(String(pp.id || ''), String(pp.catalogId || '')); }
+  for (i = 0; i < keys.length; i++) {
+    k = keys[i].replace(/^a\./, '');
+    if (k && (k === String(want.id || '').replace(/^a\./, '') || k === String(want.cid || ''))) return true;
+  }
+  return false;
+}
+// Where that song is in the queue: the match nearest to where it is expected
+// (a playlist can hold a song twice). -1: not there.
+function placeOf(want, near) {
+  var items = queueItems(), best = -1, i;
+  if (!(near >= 0)) near = 0;
+  for (i = 0; i < items.length; i++) {
+    if (itemIs(items[i], want) && (best < 0 || Math.abs(i - near) < Math.abs(best - near))) best = i;
+  }
+  return best;
+}
+function queuePos() {
+  try { if (S.music.queue && typeof S.music.queue.position === 'number') return S.music.queue.position; } catch (e) {}
+  return curIndex();
+}
+
 // Ask the player to play what is queued - and make sure it does. A start that
 // comes within about a third of a second of the previous one falls flat: the
 // player answers "ok" and plays nothing. Asking again a moment later works.
-// (since: when this start was asked for; a Stop or Pause after that ends it.)
-function playForSure(m, since) {
+// (since: when this start was asked for; a Stop or Pause after that ends it,
+// and so does a newer start: tok.)
+function playForSure(m, since, tok) {
   var tries = 0;
+  function over() { return S.haltAt > since || (tok !== undefined && tok !== S.startTok); }
   function attempt() {
     return Promise.resolve().then(function () { return m.play(); }).then(function () {
-      if (!reallyPlaying() && tries === 4 && S.haltAt <= since) dlog('start: nothing playing after 5 tries, state ' + stateName());
-      if (reallyPlaying() || ++tries > 4 || S.haltAt > since) return null;
+      if (!reallyPlaying() && tries === 4 && !over()) dlog('start: nothing playing after 5 tries, state ' + stateName());
+      if (reallyPlaying() || ++tries > 4 || over()) return null;
       return new Promise(function (go) { setTimeout(go, 300); }).then(function () {
-        return (reallyPlaying() || S.haltAt > since) ? null : attempt();
+        return (reallyPlaying() || over()) ? null : attempt();
       });
     });
   }
   return attempt();
 }
 
-function startNow(m, mk, opts, shuffle) {
+function startNow(m, mk, opts, shuffle, want, tok) {
   var PM = mk && mk.PlayerShuffleMode, resume = false, settled = false, since = performance.now();
   RC.wantAt = since;
   dlog('start: ' + Object.keys(opts).map(function (k) { return k === 'songs' ? 'songs x' + opts.songs.length : k; }).join(' ') + ', state ' + stateName());
   try {
-    if (PM && shuffle !== undefined) m.shuffleMode = shuffle ? PM.songs : PM.off;
-    else if (PM && m.shuffleMode !== PM.off) {
+    if (PM && shuffle !== undefined) { S.shuffleHeld = false; m.shuffleMode = shuffle ? PM.songs : PM.off; }
+    else if (PM && (S.shuffleHeld || m.shuffleMode !== PM.off)) {
       // Shuffle is on and one song was picked. Handed over like that, the
       // player shuffles the list and then starts at the picked song's old
       // *position* - on some other song. So: queue in order with shuffle off,
       // start the picked song, and only then switch shuffle back on. That
       // keeps what is playing and shuffles everything else behind it.
+      // (Held already: an earlier start that has not finished switched it
+      // off; this one takes over switching it back on.)
       resume = true;
       S.shuffleHeld = true;            // the SHUFFLE lamp stays lit meanwhile
       m.shuffleMode = PM.off;
     }
   } catch (e) {}
+  function current() { return tok === undefined || tok === S.startTok; }
   function settle() {
     if (settled) return;
     settled = true;
-    if (!resume || !S.shuffleHeld) return;        // (the listener may have switched shuffle off meanwhile)
+    // (the listener may have switched shuffle off meanwhile; and a newer
+    // start that is waiting takes the switch over: it is still held for it)
+    if (!resume || !S.shuffleHeld || !current()) return;
     S.shuffleHeld = false;
     try { m.shuffleMode = PM.songs; } catch (e) {}
     refreshModes();
   }
   var work = Promise.resolve()
     .then(function () { return m.setQueue(opts); })
-    .then(function () { return playForSure(m, since); })
-    .then(settle, function (e) { settle(); notice('COULD NOT START PLAYBACK: ' + errText(e)); });
-  // ...but never wait on the player for ever
-  return Promise.race([work, new Promise(function (done) { setTimeout(done, 9000); })]).then(settle);
+    .then(function () {
+      if (!current()) return null;     // a newer pick is waiting: the playing is up to it
+      // The song to start at is given by its place in the list on screen. The
+      // player leaves out of its queue what cannot be played (a song no longer
+      // on Apple Music, in a playlist), so from there on its places are not
+      // the list's: it would start some song further on. Start the picked one.
+      var pos = queuePos(), at = want ? placeOf(want, pos) : -1;
+      if (at >= 0 && at !== pos) {
+        dlog('start: the picked song is number ' + (at + 1) + ' in the queue, not ' + (pos + 1) + ': starting it there');
+        return Promise.resolve().then(function () { return m.changeToMediaAtIndex(at); })
+          .then(null, function () {}).then(function () { return playForSure(m, since, tok); });
+      }
+      return playForSure(m, since, tok);
+    })
+    .then(function () {
+      // and say so in the log if it is not the picked one all the same
+      var it = nowItem();
+      if (want && it && current() && S.haltAt <= since && !itemIs(it, want)) {
+        var at = placeOf(want, curIndex());
+        dlog('start: the player started ' + String(it.id).slice(0, 30) + ', not the picked ' + String(want.id).slice(0, 30) + (at >= 0 ? ': moving to number ' + (at + 1) : ' (it is not in the queue)'));
+        if (at >= 0) return Promise.resolve().then(function () { return m.changeToMediaAtIndex(at); }).then(null, function () {});
+      }
+    })
+    .then(settle, function (e) {
+      settle();
+      dlog('start: failed: ' + errText(e));
+      if (current()) notice('COULD NOT START PLAYBACK: ' + errText(e));
+    });
+  // ...but never wait on the player for ever. If it has not answered in 9 s
+  // the next start may go ahead; shuffle stays held until this one has
+  // finished (switched back on while the queue is still being made, the
+  // player would shuffle it and start some other song), at most 40 s.
+  setTimeout(settle, 40000);
+  return Promise.race([work, new Promise(function (done) {
+    setTimeout(function () { if (!settled) dlog('start: the player has not answered in 9 s, state ' + stateName()); done(); }, 9000);
+  })]);
+}
+// Play the song in the queue at place i - the one the listener sees there (id).
+// After any start that is under way, and by the song rather than the place:
+// shuffling, or a new queue, moves the songs about under the list on screen.
+function jumpTo(i, id) {
+  rcWant();
+  S.starting = S.starting.then(function () {
+    var items = queueItems(), at = i, k;
+    if (id && !(items[at] && rcItemId(items[at]) === id)) {
+      at = -1;
+      for (k = 0; k < items.length; k++) if (rcItemId(items[k]) === id && (at < 0 || Math.abs(k - i) < Math.abs(at - i))) at = k;
+    }
+    if (at < 0) { notice('THAT SONG IS NO LONGER IN THE QUEUE'); renderQueue(); return; }
+    call('changeToMediaAtIndex', at);
+  });
 }
 function idsFrom(items, start, max) {
   var ids = [];
@@ -5299,7 +5448,7 @@ function syncAddKey() {
 function queueSong(s, next) {
   var m = S.music;
   if (!m || !s) return;
-  if (!queueItems().length) { startQueue({ songs: [s.id] }); return; }
+  if (!queueItems().length) { startQueue({ songs: [s.id] }, undefined, { id: s.id, cid: s.cid }); return; }
   var fn = next ? m.playNext : m.playLater;
   if (typeof fn !== 'function') { notice('THIS PLAYER CANNOT DO THAT'); return; }
   Promise.resolve().then(function () { return fn.call(m, { song: s.id }); }).then(function () {
@@ -5450,7 +5599,7 @@ function viewSongs(tok) {
     if (total < 0) { showMsg('LOADING', '読込中'); return; }
     showTable({
       items: DB.songs, total: total,
-      play: function (i) { startQueue({ songs: songIdsFrom(i) }); },
+      play: function (i) { var s = DB.songs[i]; startQueue({ songs: songIdsFrom(i) }, undefined, s ? { id: s.id, cid: s.cid } : null); },
       shuffle: function () { startQueue({ songs: randomIds(DB.songs, QUEUE_CHUNK) }, false); }
     });
   }
@@ -5529,7 +5678,7 @@ function viewCollection(v, tok) {
     var q = {}; q[opt] = v.id;
     showTable({
       items: list, total: list.length, numbered: !isPl,
-      play: function (i) { var o = {}; o[opt] = v.id; o.startWith = i; startQueue(o); },
+      play: function (i) { var o = {}, s = list[i]; o[opt] = v.id; o.startWith = i; startQueue(o, undefined, s ? { id: s.id, cid: s.cid } : null); },
       shuffle: function () { startQueue(q, true); }
     });
     if (done && fromApple) fetchRowFlags(list);
@@ -5587,7 +5736,7 @@ function viewSearch(v, tok) {
     var body = ui.bBody;
     function sec(title, ja) { body.appendChild(h('div', { class: 'mpb-sec' }, h('span', { text: title }), jp(ja))); }
     function songRows(name, items) {
-      B.secs[name] = { items: items, play: function (i) { startQueue({ songs: idsFrom(items, 0, QUEUE_CHUNK), startWith: i }); } };
+      B.secs[name] = { items: items, play: function (i) { var s = items[i]; startQueue({ songs: idsFrom(items, 0, QUEUE_CHUNK), startWith: i }, undefined, s ? { id: s.id, cid: s.cid } : null); } };
       for (var i = 0; i < items.length; i++) {
         var row = makeTrackRow();
         row.setAttribute('data-i', String(i));
@@ -5873,7 +6022,7 @@ function onListMenu(e) {
   var i = parseInt(row.getAttribute('data-i'), 10), it = queueItems()[i];
   if (!it) return;
   e.preventDefault();
-  openSongMenu(songFromItem(it), e.clientX, e.clientY, i === curIndex() ? {} : { play: function () { call('changeToMediaAtIndex', i); } });
+  openSongMenu(songFromItem(it), e.clientX, e.clientY, i === curIndex() ? {} : { play: function () { jumpTo(i, row.getAttribute('data-id') || ''); } });
 }
 
 function onSearchInput() {
@@ -7240,6 +7389,7 @@ window.__mp = {
     font: editFontPicked, noFont: editNoFont, file: skinFile, importSkin: importSkin, remove: deleteTheme, fileName: fileNameFor },
   cover: COVER, coverPalette: coverPalette, nowPlaying: NP, hostMessage: onHostMessage,
   recover: RC, playbackError: onPlaybackError, recoverNote: rcNote, recoverWatch: rcWatch, recoverStreak: rcStreak, recoverAsked: rcAsked,
+  startQueue: startQueue, jumpTo: jumpTo, itemIs: itemIs, placeOf: placeOf, starting: starting, recoverTick: rcTick, renderQueue: renderQueue,
   areas: AREAS, areaPhoto: areaPhoto, areaLayers: function () { return ui.ar; }, viewOf: viewOf, areaBox: areaBox, framer: { at: frameAt, zoom: frameZoom }
 };
 
